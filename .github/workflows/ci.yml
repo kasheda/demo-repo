@@ -6,6 +6,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     - run: |
-        echo "Starting test"
-        exit 1  # This will cause the job to fail
-        echo "This should never run"
+        run: |
+          set -e
+          chmod +x system_info.sh
+          ./system_info.sh
+          echo "Pipeline completed successfully"
