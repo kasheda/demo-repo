@@ -1,0 +1,85 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Check Required Files') {
+            steps {
+                sh '''
+                set -e
+                test -f backend/app.js
+                test -f backend/package.json
+                test -f backend/Dockerfile
+                test -f frontend/index.html
+                test -f frontend/nginx.conf
+                test -f frontend/Dockerfile
+                test -f docker-compose.yml
+                echo "All required files are present"
+                '''
+            }
+        }
+
+        stage('Validate Backend Syntax') {
+            steps {
+                dir('backend') {
+                    sh '''
+                    set -e
+                    npm install
+                    node --check app.js
+                    echo "Backend syntax validation passed"
+                    '''
+                }
+            }
+        }
+
+        stage('Build Backend Image') {
+            steps {
+                sh '''
+                set -e
+                docker build -t day22-backend ./backend
+                '''
+            }
+        }
+
+        stage('Build Frontend Image') {
+            steps {
+                sh '''
+                set -e
+                docker build -t day22-frontend ./frontend
+                '''
+            }
+        }
+
+        stage('Deploy with Compose') {
+            steps {
+                sh '''
+                set -e
+                docker-compose down || true
+                docker-compose up -d --build
+                '''
+            }
+        }
+
+        stage('Verify Containers') {
+            steps {
+                sh '''
+                set -e
+                docker ps
+                docker logs day22_backend || true
+                docker logs day22_frontend || true
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Pipeline completed successfully'
+        }
+        failure {
+            echo 'Pipeline failed. Check the failed stage logs.'
+        }
+        always {
+            sh 'docker ps || true'
+        }
+    }
+}
