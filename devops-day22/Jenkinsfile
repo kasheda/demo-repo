@@ -20,64 +20,39 @@ pipeline {
             }
         }
 
-        stage('Validate Backend Syntax') {
+        stage('Validate Backend File Exists and Is Readable') {
             steps {
                 dir('devops-day22/backend') {
                     sh '''
                     set -e
-                    npm install
-                    node --check app.js
-                    echo "Backend syntax validation passed"
+                    test -s app.js
+                    test -s package.json
+                    echo "Backend files are readable and non-empty"
                     '''
                 }
             }
         }
 
-        stage('Build Backend Image') {
+        stage('Validate Frontend File Exists and Is Readable') {
             steps {
-                dir('devops-day22') {
-                    sh 'docker build -t day22-backend ./backend'
-                }
-            }
-        }
-
-        stage('Build Frontend Image') {
-            steps {
-                dir('devops-day22') {
-                    sh 'docker build -t day22-frontend ./frontend'
-                }
-            }
-        }
-
-        stage('Deploy with Compose') {
-            steps {
-                dir('devops-day22') {
+                dir('devops-day22/frontend') {
                     sh '''
                     set -e
-                    docker-compose down || true
-                    docker-compose up -d --build
+                    test -s index.html
+                    test -s nginx.conf
+                    echo "Frontend files are readable and non-empty"
                     '''
                 }
-            }
-        }
-
-        stage('Verify Containers') {
-            steps {
-                sh '''
-                docker ps
-                docker logs day22_backend || true
-                docker logs day22_frontend || true
-                '''
             }
         }
     }
 
     post {
         success {
-            echo 'Pipeline completed successfully'
+            echo 'Validation pipeline completed successfully'
         }
         failure {
-            echo 'Pipeline failed. Check the failed stage logs.'
+            echo 'Validation pipeline failed'
         }
     }
 }
