@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DevOps Day 22</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      padding: 40px;
+      background: #f4f4f4;
+      color: #222;
+    }
+    .card {
+      max-width: 700px;
+      margin: auto;
+      background: white;
+      padding: 24px;
+      border-radius: 12px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.08);
+    }
+    button {
+      padding: 10px 16px;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    pre {
+      background: #111;
+      color: #0f0;
+      padding: 16px;
+      border-radius: 8px;
+      overflow-x: auto;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>DevOps Day 22</h1>
+    <p>This frontend calls the backend API through Nginx proxy.</p>
+    <button onclick="loadMessage()">Call Backend</button>
+    <h3>Response</h3>
+    <pre id="result">Click the button to fetch data...</pre>
+  </div>
+
+  <script>
+    async function loadMessage() {
+      const resultBox = document.getElementById("result");
+      resultBox.textContent = "Loading...";
+
+      try {
+        const response = await fetch("/api/message");
+        const data = await response.json();
+        resultBox.textContent = JSON.stringify(data, null, 2);
+      } catch (error) {
+        resultBox.textContent = "Error: " + error.message;
+      }
+    }
+  </script>
+</body>
+</html>
