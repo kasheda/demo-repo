@@ -4,23 +4,25 @@ pipeline {
     stages {
         stage('Check Required Files') {
             steps {
-                sh '''
-                set -e
-                test -f backend/app.js
-                test -f backend/package.json
-                test -f backend/Dockerfile
-                test -f frontend/index.html
-                test -f frontend/nginx.conf
-                test -f frontend/Dockerfile
-                test -f docker-compose.yml
-                echo "All required files are present"
-                '''
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+                    test -f backend/app.js
+                    test -f backend/package.json
+                    test -f backend/Dockerfile
+                    test -f frontend/index.html
+                    test -f frontend/nginx.conf
+                    test -f frontend/Dockerfile
+                    test -f docker-compose.yml
+                    echo "All required files are present"
+                    '''
+                }
             }
         }
 
         stage('Validate Backend Syntax') {
             steps {
-                dir('backend') {
+                dir('devops-day22/backend') {
                     sh '''
                     set -e
                     npm install
@@ -33,36 +35,35 @@ pipeline {
 
         stage('Build Backend Image') {
             steps {
-                sh '''
-                set -e
-                docker build -t day22-backend ./backend
-                '''
+                dir('devops-day22') {
+                    sh 'docker build -t day22-backend ./backend'
+                }
             }
         }
 
         stage('Build Frontend Image') {
             steps {
-                sh '''
-                set -e
-                docker build -t day22-frontend ./frontend
-                '''
+                dir('devops-day22') {
+                    sh 'docker build -t day22-frontend ./frontend'
+                }
             }
         }
 
         stage('Deploy with Compose') {
             steps {
-                sh '''
-                set -e
-                docker-compose down || true
-                docker-compose up -d --build
-                '''
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+                    docker-compose down || true
+                    docker-compose up -d --build
+                    '''
+                }
             }
         }
 
         stage('Verify Containers') {
             steps {
                 sh '''
-                set -e
                 docker ps
                 docker logs day22_backend || true
                 docker logs day22_frontend || true
@@ -77,9 +78,6 @@ pipeline {
         }
         failure {
             echo 'Pipeline failed. Check the failed stage logs.'
-        }
-        always {
-            sh 'docker ps || true'
         }
     }
 }
