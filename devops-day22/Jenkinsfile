@@ -84,9 +84,29 @@ pipeline {
             }
         }
 
-        stage('Verify Containers') {
+        stage('Wait for App Startup') {
             steps {
                 sh '''
+                echo "Waiting 10 seconds for containers to start..."
+                sleep 10
+                '''
+            }
+        }
+
+        stage('Verify Backend Health') {
+            steps {
+                sh '''
+                set -e
+                echo "Checking backend health..."
+                curl -f http://localhost:3000/health
+                '''
+            }
+        }
+
+        stage('Verify Running Containers') {
+            steps {
+                sh '''
+                set -e
                 docker ps
                 docker logs day22_backend || true
                 docker logs day22_frontend || true
@@ -97,10 +117,10 @@ pipeline {
 
     post {
         success {
-            echo 'Day 24 pipeline completed successfully'
+            echo 'Day 25 pipeline completed successfully'
         }
         failure {
-            echo 'Day 24 pipeline failed. Check the failed stage logs.'
+            echo 'Day 25 pipeline failed. Check logs and health verification stage.'
         }
     }
 }
