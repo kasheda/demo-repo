@@ -84,38 +84,31 @@ pipeline {
             }
         }
 
-        stage('Wait for App Startup') {
+        stage('Wait for Docker Health') {
             steps {
                 sh '''
-                echo "Waiting 10 seconds for containers to start..."
-                sleep 10
+                set -e
+                echo "Waiting for backend container health..."
+                for i in $(seq 1 12); do
+                  STATUS=$(docker inspect day22_backend --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                  echo "Current backend health: $STATUS"
+                  if [ "$STATUS" = "healthy" ]; then
+                    exit 0
+                  fi
+                  sleep 5
+                done
+                echo "Backend did not become healthy in time"
+                exit 1
                 '''
             }
         }
-
-      stage('Verify Backend Health') {
-    steps {
-        sh '''
-        set -e
-        echo "Checking backend health from inside backend container..."
-        docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/health"
-        '''
-    }
-}
-        stage('Debug Backend Container') {
-    steps {
-        sh '''
-        docker logs day22_backend || true
-        docker exec day22_backend sh -c "netstat -tln 2>/dev/null || ss -tln 2>/dev/null || true"
-        '''
-    }
-}
 
         stage('Verify Running Containers') {
             steps {
                 sh '''
                 set -e
                 docker ps
+                docker inspect day22_backend --format='{{.State.Status}} / {{.State.Health.Status}}'
                 docker logs day22_backend || true
                 docker logs day22_frontend || true
                 '''
@@ -125,10 +118,10 @@ pipeline {
 
     post {
         success {
-            echo 'Day 25 pipeline completed successfully'
+            echo 'Day 26 pipeline completed successfully'
         }
         failure {
-            echo 'Day 25 pipeline failed. Check logs and health verification stage.'
+            echo 'Day 26 pipeline failed. Check container health and logs.'
         }
     }
 }
