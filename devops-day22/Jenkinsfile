@@ -93,15 +93,15 @@ pipeline {
             }
         }
 
-        stage('Verify Backend Health') {
-            steps {
-                sh '''
-                set -e
-                echo "Checking backend health..."
-                curl -f http://localhost:3000/health
-                '''
-            }
-        }
+       stage('Verify Backend Health') {
+    steps {
+        sh '''
+        set -e
+        echo "Checking backend health from inside backend container..."
+        docker exec day22_backend wget -qO- http://localhost:3000/health
+        '''
+    }
+}
 
         stage('Verify Running Containers') {
             steps {
