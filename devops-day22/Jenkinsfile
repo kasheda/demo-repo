@@ -33,34 +33,74 @@ pipeline {
                 npm --version || true
                 which docker || true
                 docker --version || true
+                docker compose version || true
                 '''
             }
         }
 
-        stage('Validate Backend Syntax If Node Exists') {
+        stage('Validate Backend Syntax') {
             steps {
                 dir('devops-day22/backend') {
                     sh '''
                     set -e
-                    if command -v node >/dev/null 2>&1; then
-                      node --check app.js
-                      echo "Backend syntax validation passed"
-                    else
-                      echo "Node is not installed in this Jenkins runtime"
-                      exit 1
-                    fi
+                    node --check app.js
+                    echo "Backend syntax validation passed"
                     '''
                 }
+            }
+        }
+
+        stage('Build Backend Image') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+                    docker build -t day22-backend ./backend
+                    '''
+                }
+            }
+        }
+
+        stage('Build Frontend Image') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+                    docker build -t day22-frontend ./frontend
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy with Compose') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+                    docker compose down || true
+                    docker compose up -d --build
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Containers') {
+            steps {
+                sh '''
+                docker ps
+                docker logs day22_backend || true
+                docker logs day22_frontend || true
+                '''
             }
         }
     }
 
     post {
         success {
-            echo 'Day 23 pipeline completed successfully'
+            echo 'Day 24 pipeline completed successfully'
         }
         failure {
-            echo 'Day 23 pipeline failed due to missing tools or invalid code'
+            echo 'Day 24 pipeline failed. Check the failed stage logs.'
         }
     }
 }
