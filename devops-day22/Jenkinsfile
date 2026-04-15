@@ -93,12 +93,20 @@ pipeline {
             }
         }
 
-       stage('Verify Backend Health') {
+      stage('Verify Backend Health') {
     steps {
         sh '''
         set -e
         echo "Checking backend health from inside backend container..."
-        docker exec day22_backend wget -qO- http://localhost:3000/health
+        docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/health"
+        '''
+    }
+}
+        stage('Debug Backend Container') {
+    steps {
+        sh '''
+        docker logs day22_backend || true
+        docker exec day22_backend sh -c "netstat -tln 2>/dev/null || ss -tln 2>/dev/null || true"
         '''
     }
 }
