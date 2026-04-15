@@ -20,27 +20,35 @@ pipeline {
             }
         }
 
-        stage('Validate Backend File Exists and Is Readable') {
+        stage('Show Environment') {
+            steps {
+                sh '''
+                set +e
+                echo "Checking available tools..."
+                which git || true
+                git --version || true
+                which node || true
+                node --version || true
+                which npm || true
+                npm --version || true
+                which docker || true
+                docker --version || true
+                '''
+            }
+        }
+
+        stage('Validate Backend Syntax If Node Exists') {
             steps {
                 dir('devops-day22/backend') {
                     sh '''
                     set -e
-                    test -s app.js
-                    test -s package.json
-                    echo "Backend files are readable and non-empty"
-                    '''
-                }
-            }
-        }
-
-        stage('Validate Frontend File Exists and Is Readable') {
-            steps {
-                dir('devops-day22/frontend') {
-                    sh '''
-                    set -e
-                    test -s index.html
-                    test -s nginx.conf
-                    echo "Frontend files are readable and non-empty"
+                    if command -v node >/dev/null 2>&1; then
+                      node --check app.js
+                      echo "Backend syntax validation passed"
+                    else
+                      echo "Node is not installed in this Jenkins runtime"
+                      exit 1
+                    fi
                     '''
                 }
             }
@@ -49,10 +57,10 @@ pipeline {
 
     post {
         success {
-            echo 'Validation pipeline completed successfully'
+            echo 'Day 23 pipeline completed successfully'
         }
         failure {
-            echo 'Validation pipeline failed'
+            echo 'Day 23 pipeline failed due to missing tools or invalid code'
         }
     }
 }
