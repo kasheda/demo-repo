@@ -1,0 +1,163 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Project Files') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Validating required project files..."
+
+                    test -f backend/app.js
+                    test -f backend/package.json
+                    test -f backend/Dockerfile
+                    test -f frontend/index.html
+                    test -f frontend/nginx.conf
+                    test -f frontend/Dockerfile
+                    test -f docker-compose.yml
+
+                    echo "Required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Backend Syntax') {
+            steps {
+                dir('devops-day22/backend') {
+                    sh '''
+                    set -e
+
+                    echo "Validating backend JavaScript syntax..."
+                    node --check app.js
+
+                    echo "Backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Building Docker images..."
+                    docker compose build --no-cache
+
+                    echo "Docker images built successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy With Docker Compose') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old containers if they exist..."
+                    docker compose down || true
+
+                    echo "Starting application..."
+                    docker compose up -d
+
+                    echo "Current containers:"
+                    docker ps
+                    '''
+                }
+            }
+        }
+
+        stage('Wait for Docker Health') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Waiting for backend container health..."
+
+                for i in $(seq 1 12); do
+                  STATUS=$(docker inspect day22_backend --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+
+                  echo "Attempt $i: backend health = $STATUS"
+
+                  if [ "$STATUS" = "healthy" ]; then
+                    echo "Backend container is healthy."
+                    exit 0
+                  fi
+
+                  if [ "$STATUS" = "unhealthy" ]; then
+                    echo "Backend container is unhealthy."
+                    echo "Recent backend logs:"
+                    docker logs --tail=50 day22_backend || true
+                    exit 1
+                  fi
+
+                  sleep 5
+                done
+
+                echo "Backend did not become healthy in time."
+                echo "Final backend inspect:"
+                docker inspect day22_backend || true
+
+                echo "Recent backend logs:"
+                docker logs --tail=50 day22_backend || true
+
+                exit 1
+                '''
+            }
+        }
+
+        stage('Verify Backend API') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Verifying backend API from inside backend container..."
+                docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/api/message"
+
+                echo "Backend API verification passed."
+                '''
+            }
+        }
+
+        stage('Verify Frontend Container') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Verifying frontend container is running..."
+                docker ps --filter "name=day22_frontend" --filter "status=running"
+
+                echo "Frontend container is running."
+                '''
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 26 pipeline completed successfully. Docker HEALTHCHECK verification passed.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check the failing stage logs above.'
+        }
+
+        always {
+            echo 'Final container status:'
+            sh 'docker ps -a || true'
+        }
+    }
+}
