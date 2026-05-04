@@ -1,0 +1,272 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Project Files') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Validating required project files..."
+
+                    test -f backend/app.js
+                    test -f backend/package.json
+                    test -f backend/Dockerfile
+                    test -f backend/.dockerignore
+
+                    test -f frontend/index.html
+                    test -f frontend/nginx.conf
+                    test -f frontend/Dockerfile
+                    test -f frontend/.dockerignore
+
+                    test -f docker-compose.yml
+                    test -f Jenkinsfile
+
+                    echo "All required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Backend Syntax') {
+            steps {
+                dir('devops-day22/backend') {
+                    sh '''
+                    set -e
+
+                    echo "Validating backend JavaScript syntax..."
+                    node --check app.js
+
+                    echo "Backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Frontend Files') {
+            steps {
+                dir('devops-day22/frontend') {
+                    sh '''
+                    set -e
+
+                    echo "Validating frontend files..."
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    echo "Frontend files exist and are not empty."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Building Docker images without cache..."
+                    docker compose build --no-cache
+
+                    echo "Docker images built successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy With Docker Compose') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old containers if they exist..."
+                    docker compose down || true
+
+                    echo "Starting application..."
+                    docker compose up -d
+
+                    echo "Current containers:"
+                    docker ps
+                    '''
+                }
+            }
+        }
+
+        stage('Wait for Docker Health') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Waiting for backend container health..."
+
+                for i in $(seq 1 12); do
+                  STATUS=$(docker inspect day22_backend --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+
+                  echo "Attempt $i: backend health = $STATUS"
+
+                  if [ "$STATUS" = "healthy" ]; then
+                    echo "Backend container is healthy."
+                    exit 0
+                  fi
+
+                  if [ "$STATUS" = "unhealthy" ]; then
+                    echo "Backend container is unhealthy."
+                    echo "Recent backend logs:"
+                    docker logs --tail=50 day22_backend || true
+                    exit 1
+                  fi
+
+                  sleep 5
+                done
+
+                echo "Backend did not become healthy in time."
+                echo "Final backend inspect:"
+                docker inspect day22_backend || true
+
+                echo "Recent backend logs:"
+                docker logs --tail=50 day22_backend || true
+
+                exit 1
+                '''
+            }
+        }
+
+        stage('Smoke Test Backend Health') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing backend health endpoint..."
+                RESPONSE=$(docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/health")
+
+                echo "Backend health response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"status":"ok"'
+
+                echo "Backend health smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Backend API') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing backend API endpoint..."
+                RESPONSE=$(docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/api/message")
+
+                echo "Backend API response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'Hello from backend API'
+
+                echo "Backend API smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Frontend Page') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing frontend page from inside frontend container..."
+                RESPONSE=$(docker exec day22_frontend sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "Frontend page response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'DevOps Day 28'
+
+                echo "Frontend page smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Frontend API Proxy') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing frontend-to-backend proxy through Nginx..."
+                RESPONSE=$(docker exec day22_frontend sh -c "wget -qO- http://127.0.0.1/api/message")
+
+                echo "Frontend proxy API response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'Hello from backend API'
+
+                echo "Frontend API proxy smoke test passed."
+                '''
+            }
+        }
+
+        stage('Show Deployment Diagnostics') {
+            steps {
+                dir('devops-day22') {
+                    sh '''
+                    set -e
+
+                    echo "Docker Compose service status:"
+                    docker compose ps
+
+                    echo "All containers:"
+                    docker ps -a
+
+                    echo "Backend health status:"
+                    docker inspect day22_backend --format='{{.State.Health.Status}}' || true
+
+                    echo "Recent backend logs:"
+                    docker logs --tail=30 day22_backend || true
+
+                    echo "Recent frontend logs:"
+                    docker logs --tail=30 day22_frontend || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 28 pipeline completed successfully. Full-stack smoke tests passed.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir('devops-day22') {
+                sh '''
+                echo "Final Docker Compose status:"
+                docker compose ps || true
+
+                echo "Final container list:"
+                docker ps -a || true
+
+                echo "Backend health:"
+                docker inspect day22_backend --format='{{.State.Health.Status}}' || true
+
+                echo "Backend logs:"
+                docker logs --tail=50 day22_backend || true
+
+                echo "Frontend logs:"
+                docker logs --tail=50 day22_frontend || true
+                '''
+            }
+        }
+    }
+}
