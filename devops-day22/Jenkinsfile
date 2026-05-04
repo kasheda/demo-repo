@@ -1,6 +1,12 @@
 pipeline {
     agent any
 
+    environment {
+        PROJECT_DIR = 'devops-day22'
+        BACKEND_CONTAINER = 'day22_backend'
+        FRONTEND_CONTAINER = 'day22_frontend'
+    }
+
     stages {
         stage('Checkout') {
             steps {
@@ -9,9 +15,37 @@ pipeline {
             }
         }
 
+        stage('Validate Jenkins Environment') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Checking Jenkins environment..."
+
+                if ! command -v docker >/dev/null 2>&1; then
+                    echo "ERROR: Docker is not available in Jenkins."
+                    echo "Your pipeline requires Docker for build, deploy, diagnostics, and Node syntax validation."
+                    exit 1
+                fi
+
+                docker --version
+
+                if ! docker compose version >/dev/null 2>&1; then
+                    echo "ERROR: Docker Compose plugin is not available in Jenkins."
+                    echo "Install Docker Compose plugin or use a Jenkins agent that includes it."
+                    exit 1
+                fi
+
+                docker compose version
+
+                echo "Jenkins environment looks good."
+                '''
+            }
+        }
+
         stage('Validate Project Files') {
             steps {
-                dir('devops-day22') {
+                dir("${PROJECT_DIR}") {
                     sh '''
                     set -e
 
@@ -38,12 +72,17 @@ pipeline {
 
         stage('Validate Backend Syntax') {
             steps {
-                dir('devops-day22/backend') {
+                dir("${PROJECT_DIR}/backend") {
                     sh '''
                     set -e
 
-                    echo "Validating backend JavaScript syntax..."
-                    node --check app.js
+                    echo "Validating backend JavaScript syntax using Node Docker image..."
+
+                    docker run --rm \
+                      -v "$PWD":/app \
+                      -w /app \
+                      node:20-alpine \
+                      node --check app.js
 
                     echo "Backend syntax is valid."
                     '''
@@ -53,7 +92,7 @@ pipeline {
 
         stage('Validate Frontend Files') {
             steps {
-                dir('devops-day22/frontend') {
+                dir("${PROJECT_DIR}/frontend") {
                     sh '''
                     set -e
 
@@ -61,6 +100,7 @@ pipeline {
 
                     test -s index.html
                     test -s nginx.conf
+                    test -s Dockerfile
 
                     echo "Frontend files exist and are not empty."
                     '''
@@ -70,7 +110,7 @@ pipeline {
 
         stage('Build Docker Images') {
             steps {
-                dir('devops-day22') {
+                dir("${PROJECT_DIR}") {
                     sh '''
                     set -e
 
@@ -85,12 +125,12 @@ pipeline {
 
         stage('Deploy With Docker Compose') {
             steps {
-                dir('devops-day22') {
+                dir("${PROJECT_DIR}") {
                     sh '''
                     set -e
 
                     echo "Stopping old containers if they exist..."
-                    docker compose down || true
+                    docker compose down --remove-orphans || true
 
                     echo "Starting application..."
                     docker compose up -d
@@ -215,9 +255,9 @@ pipeline {
 
         stage('Show Deployment Diagnostics') {
             steps {
-                dir('devops-day22') {
+                dir("${PROJECT_DIR}") {
                     sh '''
-                    set -e
+                    set +e
 
                     echo "Docker Compose service status:"
                     docker compose ps
@@ -226,13 +266,13 @@ pipeline {
                     docker ps -a
 
                     echo "Backend health status:"
-                    docker inspect day22_backend --format='{{.State.Health.Status}}' || true
+                    docker inspect day22_backend --format='{{.State.Health.Status}}'
 
                     echo "Recent backend logs:"
-                    docker logs --tail=30 day22_backend || true
+                    docker logs --tail=30 day22_backend
 
                     echo "Recent frontend logs:"
-                    docker logs --tail=30 day22_frontend || true
+                    docker logs --tail=30 day22_frontend
                     '''
                 }
             }
@@ -249,22 +289,24 @@ pipeline {
         }
 
         always {
-            dir('devops-day22') {
+            dir("${PROJECT_DIR}") {
                 sh '''
+                set +e
+
                 echo "Final Docker Compose status:"
-                docker compose ps || true
+                docker compose ps
 
                 echo "Final container list:"
-                docker ps -a || true
+                docker ps -a
 
                 echo "Backend health:"
-                docker inspect day22_backend --format='{{.State.Health.Status}}' || true
+                docker inspect day22_backend --format='{{.State.Health.Status}}'
 
                 echo "Backend logs:"
-                docker logs --tail=50 day22_backend || true
+                docker logs --tail=50 day22_backend
 
                 echo "Frontend logs:"
-                docker logs --tail=50 day22_frontend || true
+                docker logs --tail=50 day22_frontend
                 '''
             }
         }
