@@ -24,7 +24,7 @@ pipeline {
 
                 if ! command -v docker >/dev/null 2>&1; then
                     echo "ERROR: Docker is not available in Jenkins."
-                    echo "Your pipeline requires Docker for build, deploy, diagnostics, and Node syntax validation."
+                    echo "Fix Jenkins first: install Docker CLI or run Jenkins with Docker socket mounted."
                     exit 1
                 fi
 
@@ -32,7 +32,7 @@ pipeline {
 
                 if ! docker compose version >/dev/null 2>&1; then
                     echo "ERROR: Docker Compose plugin is not available in Jenkins."
-                    echo "Install Docker Compose plugin or use a Jenkins agent that includes it."
+                    echo "Fix Jenkins first: install docker-compose-plugin."
                     exit 1
                 fi
 
@@ -161,7 +161,6 @@ pipeline {
 
                   if [ "$STATUS" = "unhealthy" ]; then
                     echo "Backend container is unhealthy."
-                    echo "Recent backend logs:"
                     docker logs --tail=50 day22_backend || true
                     exit 1
                   fi
@@ -170,10 +169,7 @@ pipeline {
                 done
 
                 echo "Backend did not become healthy in time."
-                echo "Final backend inspect:"
                 docker inspect day22_backend || true
-
-                echo "Recent backend logs:"
                 docker logs --tail=50 day22_backend || true
 
                 exit 1
@@ -188,9 +184,6 @@ pipeline {
 
                 echo "Smoke testing backend health endpoint..."
                 RESPONSE=$(docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/health")
-
-                echo "Backend health response:"
-                echo "$RESPONSE"
 
                 echo "$RESPONSE" | grep '"status":"ok"'
 
@@ -207,9 +200,6 @@ pipeline {
                 echo "Smoke testing backend API endpoint..."
                 RESPONSE=$(docker exec day22_backend sh -c "wget -qO- http://127.0.0.1:3000/api/message")
 
-                echo "Backend API response:"
-                echo "$RESPONSE"
-
                 echo "$RESPONSE" | grep 'Hello from backend API'
 
                 echo "Backend API smoke test passed."
@@ -222,11 +212,8 @@ pipeline {
                 sh '''
                 set -e
 
-                echo "Smoke testing frontend page from inside frontend container..."
+                echo "Smoke testing frontend page..."
                 RESPONSE=$(docker exec day22_frontend sh -c "wget -qO- http://127.0.0.1/")
-
-                echo "Frontend page response:"
-                echo "$RESPONSE"
 
                 echo "$RESPONSE" | grep 'DevOps Day 28'
 
@@ -240,11 +227,8 @@ pipeline {
                 sh '''
                 set -e
 
-                echo "Smoke testing frontend-to-backend proxy through Nginx..."
+                echo "Smoke testing frontend API proxy..."
                 RESPONSE=$(docker exec day22_frontend sh -c "wget -qO- http://127.0.0.1/api/message")
-
-                echo "Frontend proxy API response:"
-                echo "$RESPONSE"
 
                 echo "$RESPONSE" | grep 'Hello from backend API'
 
@@ -259,20 +243,27 @@ pipeline {
                     sh '''
                     set +e
 
+                    if ! command -v docker >/dev/null 2>&1; then
+                        echo "Docker is not available. Skipping deployment diagnostics."
+                        exit 0
+                    fi
+
                     echo "Docker Compose service status:"
-                    docker compose ps
+                    docker compose ps || true
 
                     echo "All containers:"
-                    docker ps -a
+                    docker ps -a || true
 
                     echo "Backend health status:"
-                    docker inspect day22_backend --format='{{.State.Health.Status}}'
+                    docker inspect day22_backend --format='{{.State.Health.Status}}' || true
 
                     echo "Recent backend logs:"
-                    docker logs --tail=30 day22_backend
+                    docker logs --tail=30 day22_backend || true
 
                     echo "Recent frontend logs:"
-                    docker logs --tail=30 day22_frontend
+                    docker logs --tail=30 day22_frontend || true
+
+                    exit 0
                     '''
                 }
             }
@@ -293,20 +284,27 @@ pipeline {
                 sh '''
                 set +e
 
+                if ! command -v docker >/dev/null 2>&1; then
+                    echo "Docker is not available in Jenkins. Skipping Docker diagnostics."
+                    exit 0
+                fi
+
                 echo "Final Docker Compose status:"
-                docker compose ps
+                docker compose ps || true
 
                 echo "Final container list:"
-                docker ps -a
+                docker ps -a || true
 
                 echo "Backend health:"
-                docker inspect day22_backend --format='{{.State.Health.Status}}'
+                docker inspect day22_backend --format='{{.State.Health.Status}}' || true
 
                 echo "Backend logs:"
-                docker logs --tail=50 day22_backend
+                docker logs --tail=50 day22_backend || true
 
                 echo "Frontend logs:"
-                docker logs --tail=50 day22_frontend
+                docker logs --tail=50 day22_frontend || true
+
+                exit 0
                 '''
             }
         }
