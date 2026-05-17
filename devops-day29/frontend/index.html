@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DevOps Day 29</title>
+</head>
+<body>
+  <h1>DevOps Day 29</h1>
+  <p>Frontend is running through Nginx.</p>
+
+  <h2>Backend API Message</h2>
+  <pre id="api-message">Loading message...</pre>
+
+  <h2>Backend Runtime Config</h2>
+  <pre id="api-config">Loading config...</pre>
+
+  <script>
+    fetch('/api/message')
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-message').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-message').textContent =
+          'Failed to reach backend API: ' + error;
+      });
+
+    fetch('/api/config')
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-config').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-config').textContent =
+          'Failed to reach backend config API: ' + error;
+      });
+  </script>
+</body>
+</html>

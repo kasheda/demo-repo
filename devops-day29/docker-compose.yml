@@ -1,0 +1,23 @@
+services:
+  day29-backend:
+    build:
+      context: ./backend
+    image: day29-backend
+    container_name: day29_backend
+    environment:
+      PORT: "3000"
+      APP_ENV: "day29-compose"
+      APP_VERSION: "day29-v1"
+      SERVICE_NAME: "day29-backend"
+    ports:
+      - "3000:3000"
+
+  day29-frontend:
+    build:
+      context: ./frontend
+    image: day29-frontend
+    container_name: day29_frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - day29-backend
