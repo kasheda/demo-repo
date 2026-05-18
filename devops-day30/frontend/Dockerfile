@@ -1,19 +1,6 @@
-server {
-    listen 80;
+FROM nginx:alpine
 
-    server_name localhost;
+COPY index.html /usr/share/nginx/html/index.html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
 
-    root /usr/share/nginx/html;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    location /api/ {
-        proxy_pass http://day30-backend:3000/api/;
-        proxy_http_version 1.1;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
+EXPOSE 80
