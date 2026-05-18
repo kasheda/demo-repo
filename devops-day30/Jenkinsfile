@@ -1,0 +1,363 @@
+pipeline {
+    agent any
+
+    environment {
+        DAY_NAME = 'Day 30'
+        PROJECT_DIR = 'devops-day30'
+        BACKEND_CONTAINER = 'day30_backend'
+        FRONTEND_CONTAINER = 'day30_frontend'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 30...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Day 30 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 30 required project files..."
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+.env
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 30 file: $file"
+                        echo "Current Day 30 files:"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 30 file: $file"
+                    done
+
+                    echo "All Day 30 required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 30 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 30 backend JavaScript syntax..."
+                    node --check app.js
+
+                    echo "Day 30 backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 30 Frontend Files') {
+            steps {
+                dir("${PROJECT_DIR}/frontend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 30 frontend files..."
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    grep "DevOps Day 30" index.html
+                    grep "day30-backend" nginx.conf
+
+                    echo "Day 30 frontend files are valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 30 Env File') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 30 .env file..."
+
+                    grep "DAY30_BACKEND_PORT=3000" .env
+                    grep "DAY30_FRONTEND_PORT=8080" .env
+                    grep "DAY30_APP_ENV=day30-env-file" .env
+                    grep "DAY30_APP_VERSION=day30-v1" .env
+                    grep "DAY30_SERVICE_NAME=day30-backend" .env
+                    grep "DAY30_FEATURE_FLAG=enabled" .env
+
+                    echo "Day 30 .env file validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Render Day 30 Docker Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Rendering Day 30 Docker Compose config with .env values..."
+                    docker compose config
+
+                    echo "Day 30 Docker Compose config rendered successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 30 Docker Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Building Day 30 Docker images without cache..."
+                    docker compose build --no-cache
+
+                    echo "Day 30 Docker images built successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 30 With Docker Compose') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old Day 30 containers if they exist..."
+                    docker compose down || true
+
+                    echo "Starting Day 30 application..."
+                    docker compose up -d
+
+                    echo "Current Day 30 containers:"
+                    docker ps --filter "name=day30_"
+                    '''
+                }
+            }
+        }
+
+        stage('Wait for Day 30 Docker Health') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Waiting for Day 30 backend container health..."
+
+                for i in $(seq 1 12); do
+                  STATUS=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+
+                  echo "Attempt $i: Day 30 backend health = $STATUS"
+
+                  if [ "$STATUS" = "healthy" ]; then
+                    echo "Day 30 backend container is healthy."
+                    exit 0
+                  fi
+
+                  if [ "$STATUS" = "unhealthy" ]; then
+                    echo "Day 30 backend container is unhealthy."
+                    echo "Recent Day 30 backend logs:"
+                    docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                    exit 1
+                  fi
+
+                  sleep 5
+                done
+
+                echo "Day 30 backend did not become healthy in time."
+                echo "Final Day 30 backend inspect:"
+                docker inspect "$BACKEND_CONTAINER" || true
+
+                echo "Recent Day 30 backend logs:"
+                docker logs --tail=50 "$BACKEND_CONTAINER" || true
+
+                exit 1
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 30 Backend Health') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 30 backend health endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1:3000/health")
+
+                echo "Day 30 backend health response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"status":"ok"'
+                echo "$RESPONSE" | grep '"service":"day30-backend"'
+                echo "$RESPONSE" | grep '"environment":"day30-env-file"'
+                echo "$RESPONSE" | grep '"version":"day30-v1"'
+
+                echo "Day 30 backend health smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 30 Backend API') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 30 backend API endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1:3000/api/message")
+
+                echo "Day 30 backend API response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'Hello from Day 30 backend API'
+                echo "$RESPONSE" | grep '"service":"day30-backend"'
+                echo "$RESPONSE" | grep '"environment":"day30-env-file"'
+                echo "$RESPONSE" | grep '"featureFlag":"enabled"'
+
+                echo "Day 30 backend API smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 30 Runtime Config') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 30 runtime config endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1:3000/api/config")
+
+                echo "Day 30 runtime config response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day30-backend"'
+                echo "$RESPONSE" | grep '"environment":"day30-env-file"'
+                echo "$RESPONSE" | grep '"version":"day30-v1"'
+                echo "$RESPONSE" | grep '"featureFlag":"enabled"'
+                echo "$RESPONSE" | grep '"port":3000'
+
+                echo "Day 30 runtime config smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 30 Frontend Page') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 30 frontend page..."
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "Day 30 frontend page response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'DevOps Day 30'
+                echo "$RESPONSE" | grep 'Backend Runtime Config From .env'
+
+                echo "Day 30 frontend page smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 30 Frontend API Proxy') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 30 frontend-to-backend proxy..."
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/api/config")
+
+                echo "Day 30 frontend proxy config response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day30-backend"'
+                echo "$RESPONSE" | grep '"environment":"day30-env-file"'
+                echo "$RESPONSE" | grep '"version":"day30-v1"'
+                echo "$RESPONSE" | grep '"featureFlag":"enabled"'
+
+                echo "Day 30 frontend API proxy smoke test passed."
+                '''
+            }
+        }
+
+        stage('Show Day 30 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 30 Docker Compose service status:"
+                    docker compose ps
+
+                    echo "Day 30 containers:"
+                    docker ps -a --filter "name=day30_"
+
+                    echo "Day 30 backend health status:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                    echo "Recent Day 30 backend logs:"
+                    docker logs --tail=30 "$BACKEND_CONTAINER" || true
+
+                    echo "Recent Day 30 frontend logs:"
+                    docker logs --tail=30 "$FRONTEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 30 pipeline completed successfully. .env configuration smoke tests passed.'
+        }
+
+        failure {
+            echo 'Day 30 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 30 Docker Compose status:"
+                docker compose ps || true
+
+                echo "Final Day 30 container list:"
+                docker ps -a --filter "name=day30_" || true
+
+                echo "Final Day 30 backend health:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                echo "Final Day 30 backend logs:"
+                docker logs --tail=50 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 30 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}

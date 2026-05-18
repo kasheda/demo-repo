@@ -1,0 +1,24 @@
+services:
+  day30-backend:
+    build:
+      context: ./backend
+    image: day30-backend
+    container_name: day30_backend
+    environment:
+      PORT: "${DAY30_BACKEND_PORT}"
+      APP_ENV: "${DAY30_APP_ENV}"
+      APP_VERSION: "${DAY30_APP_VERSION}"
+      SERVICE_NAME: "${DAY30_SERVICE_NAME}"
+      FEATURE_FLAG: "${DAY30_FEATURE_FLAG}"
+    ports:
+      - "${DAY30_BACKEND_PORT}:3000"
+
+  day30-frontend:
+    build:
+      context: ./frontend
+    image: day30-frontend
+    container_name: day30_frontend
+    ports:
+      - "${DAY30_FRONTEND_PORT}:80"
+    depends_on:
+      - day30-backend
