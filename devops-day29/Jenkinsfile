@@ -16,33 +16,44 @@ pipeline {
             }
         }
 
-        stage('Validate Day 29 Project Files') {
-            steps {
-                dir("${PROJECT_DIR}") {
-                    sh '''
-                    set -e
+      stage('Validate Day 29 Project Files') {
+    steps {
+        dir("${PROJECT_DIR}") {
+            sh '''
+            set -e
 
-                    echo "Validating Day 29 required project files..."
+            echo "Validating Day 29 required project files..."
 
-                    test -f backend/app.js
-                    test -f backend/package.json
-                    test -f backend/Dockerfile
-                    test -f backend/.dockerignore
+            REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+docker-compose.yml
+Jenkinsfile
+README.md
+"
 
-                    test -f frontend/index.html
-                    test -f frontend/nginx.conf
-                    test -f frontend/Dockerfile
-                    test -f frontend/.dockerignore
+            for file in $REQUIRED_FILES; do
+              if [ ! -f "$file" ]; then
+                echo "Missing required Day 29 file: $file"
+                echo "Current Day 29 directory contents:"
+                find . -maxdepth 3 -type f | sort
+                exit 1
+              fi
 
-                    test -f docker-compose.yml
-                    test -f Jenkinsfile
-                    test -f README.md
+              echo "Found Day 29 file: $file"
+            done
 
-                    echo "All Day 29 required files found."
-                    '''
-                }
-            }
+            echo "All Day 29 required files found."
+            '''
         }
+    }
+}
 
         stage('Validate Day 29 Backend Syntax') {
             steps {
