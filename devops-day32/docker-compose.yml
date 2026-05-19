@@ -13,7 +13,7 @@ services:
     ports:
       - "${DAY32_BACKEND_PORT}:3000"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/broken-health"]
       interval: 10s
       timeout: 3s
       start_period: 5s
