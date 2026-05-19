@@ -137,35 +137,39 @@ DAY31_FEATURE_FLAG=enabled
             }
         }
 
-        stage('Validate Day 31 App Fails Without Required Env') {
-            steps {
-                dir("${PROJECT_DIR}/backend") {
-                    sh '''
-                    set -e
+      stage('Validate Day 31 App Fails Without Required Env') {
+    steps {
+        dir("${PROJECT_DIR}/backend") {
+            sh '''
+            set -e
 
-                    echo "Testing that Day 31 backend fails fast without required environment variables..."
+            echo "Installing Day 31 backend dependencies for local validation..."
+            npm install
 
-                    set +e
-                    node app.js > day31-missing-env.log 2>&1
-                    EXIT_CODE=$?
-                    set -e
+            echo "Testing that Day 31 backend fails fast without required environment variables..."
 
-                    cat day31-missing-env.log
+            set +e
+            node app.js > day31-missing-env.log 2>&1
+            EXIT_CODE=$?
+            set -e
 
-                    if [ "$EXIT_CODE" -eq 0 ]; then
-                      echo "Day 31 backend unexpectedly started without required environment variables."
-                      exit 1
-                    fi
+            cat day31-missing-env.log
 
-                    grep "Missing required environment variables" day31-missing-env.log
+            if [ "$EXIT_CODE" -eq 0 ]; then
+              echo "Day 31 backend unexpectedly started without required environment variables."
+              rm -f day31-missing-env.log
+              exit 1
+            fi
 
-                    rm -f day31-missing-env.log
+            grep "Missing required environment variables" day31-missing-env.log
 
-                    echo "Day 31 backend correctly fails when required environment variables are missing."
-                    '''
-                }
-            }
+            rm -f day31-missing-env.log
+
+            echo "Day 31 backend correctly fails when required environment variables are missing."
+            '''
         }
+    }
+}
 
         stage('Render Day 31 Docker Compose Config') {
             steps {
