@@ -1,0 +1,33 @@
+services:
+  day33-backend:
+    build:
+      context: ./backend
+    image: day33-backend
+    container_name: day33_backend
+    environment:
+      PORT: "${DAY33_BACKEND_PORT}"
+      APP_ENV: "${DAY33_APP_ENV}"
+      APP_VERSION: "${DAY33_APP_VERSION}"
+      SERVICE_NAME: "${DAY33_SERVICE_NAME}"
+      FEATURE_FLAG: "${DAY33_FEATURE_FLAG}"
+    ports:
+      - "${DAY33_BACKEND_PORT}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+
+  day33-frontend:
+    build:
+      context: ./frontend
+    image: day33-frontend
+    container_name: day33_frontend
+    ports:
+      - "${DAY33_FRONTEND_PORT}:80"
+    depends_on:
+      day33-backend:
+        condition: service_healthy
+    restart: unless-stopped
