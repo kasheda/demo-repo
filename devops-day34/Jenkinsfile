@@ -470,7 +470,11 @@ DAY34_LOG_LEVEL=
             fi
 
             echo "Checking Day 34 backend logs for controlled error entry..."
-            docker logs day34_backend > day34-backend.log
+
+            docker logs day34_backend > day34-backend.log 2>&1
+
+            echo "Captured Day 34 backend logs:"
+            cat day34-backend.log
 
             grep 'controlled_error_test_triggered' day34-backend.log
             grep 'day34-error-smoke' day34-backend.log
