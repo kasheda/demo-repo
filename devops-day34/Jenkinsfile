@@ -451,33 +451,33 @@ DAY34_LOG_LEVEL=
             }
         }
 
-        stage('Smoke Test Day 34 Controlled Error Logging') {
-            steps {
-                sh '''
-                set -e
+       stage('Smoke Test Day 34 Controlled Error Logging') {
+    steps {
+        sh '''
+            set -e
+            echo "Smoke testing Day 34 controlled error endpoint..."
 
-                echo "Smoke testing Day 34 controlled error endpoint..."
+            set +e
+            docker exec day34_backend sh -c "wget -qO- --header='X-Request-Id: day34-error-smoke' http://127.0.0.1:3000/api/error-test"
+            EXIT_CODE=$?
+            set -e
 
-                set +e
-                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-error-smoke' http://127.0.0.1:3000/api/error-test" 2>/dev/null)
-                EXIT_CODE=$?
-                set -e
+            echo "Day 34 controlled error endpoint exit code: $EXIT_CODE"
 
-                echo "Day 34 controlled error response:"
-                echo "$RESPONSE"
+            if [ "$EXIT_CODE" -eq 0 ]; then
+              echo "Expected controlled error endpoint to return non-zero because it returns HTTP 500."
+              exit 1
+            fi
 
-                if [ "$EXIT_CODE" -eq 0 ]; then
-                  echo "Day 34 error-test unexpectedly returned success."
-                  exit 1
-                fi
+            echo "Checking Day 34 backend logs for controlled error entry..."
+            docker logs day34_backend | grep "controlled_error_test_triggered"
+            docker logs day34_backend | grep "day34-error-smoke"
+            docker logs day34_backend | grep "\\"statusCode\\":500"
 
-                echo "$RESPONSE" | grep 'Day 34 controlled error test'
-                echo "$RESPONSE" | grep '"requestId":"day34-error-smoke"'
-
-                echo "Day 34 controlled error endpoint behaved as expected."
-                '''
-            }
-        }
+            echo "Day 34 controlled error logging smoke test passed."
+        '''
+    }
+}
 
         stage('Smoke Test Day 34 Frontend Page') {
             steps {
