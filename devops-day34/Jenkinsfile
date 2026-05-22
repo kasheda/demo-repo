@@ -1,0 +1,607 @@
+pipeline {
+    agent any
+
+    environment {
+        DAY_NAME = 'Day 34'
+        PROJECT_DIR = 'devops-day34'
+        BACKEND_CONTAINER = 'day34_backend'
+        FRONTEND_CONTAINER = 'day34_frontend'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 34...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Day 34 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Validating Day 34 Jenkins runtime tools..."
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+
+                echo "Day 34 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 34 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 required project files..."
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+.env
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 34 file: $file"
+                        echo "Current Day 34 files:"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 34 file: $file"
+                    done
+
+                    echo "All Day 34 required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 backend JavaScript syntax..."
+                    node --check app.js
+
+                    echo "Day 34 backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Frontend Files') {
+            steps {
+                dir("${PROJECT_DIR}/frontend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 frontend files..."
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    grep "DevOps Day 34" index.html
+                    grep "day34-backend" nginx.conf
+                    grep "X-Request-Id" nginx.conf
+
+                    echo "Day 34 frontend files are valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Env File Values') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 .env file values..."
+
+                    REQUIRED_ENV_VALUES="
+DAY34_BACKEND_PORT=3000
+DAY34_FRONTEND_PORT=8080
+DAY34_APP_ENV=day34-env-file
+DAY34_APP_VERSION=day34-v1
+DAY34_SERVICE_NAME=day34-backend
+DAY34_FEATURE_FLAG=enabled
+DAY34_LOG_LEVEL=info
+"
+
+                    for key in $REQUIRED_ENV_VALUES; do
+                      grep "$key" .env
+                      echo "Found Day 34 env value: $key"
+                    done
+
+                    echo "Day 34 .env value validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Env Example Keys') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 .env.example required keys..."
+
+                    REQUIRED_EXAMPLE_KEYS="
+DAY34_BACKEND_PORT=
+DAY34_FRONTEND_PORT=
+DAY34_APP_ENV=
+DAY34_APP_VERSION=
+DAY34_SERVICE_NAME=
+DAY34_FEATURE_FLAG=
+DAY34_LOG_LEVEL=
+"
+
+                    for key in $REQUIRED_EXAMPLE_KEYS; do
+                      grep "$key" .env.example
+                      echo "Found Day 34 env example key: $key"
+                    done
+
+                    echo "Day 34 .env.example key validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Checking Day 34 .env and .env.example key drift..."
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day34-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day34-env-example-keys.txt
+
+                    echo "Day 34 .env keys:"
+                    cat day34-env-keys.txt
+
+                    echo "Day 34 .env.example keys:"
+                    cat day34-env-example-keys.txt
+
+                    if ! diff -u day34-env-example-keys.txt day34-env-keys.txt; then
+                      echo "Day 34 config drift detected between .env and .env.example."
+                      rm -f day34-env-keys.txt day34-env-example-keys.txt
+                      exit 1
+                    fi
+
+                    rm -f day34-env-keys.txt day34-env-example-keys.txt
+
+                    echo "Day 34 .env and .env.example contain the same keys."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Logging Code') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 logging code..."
+
+                    grep "createRequestId" app.js
+                    grep "request_completed" app.js
+                    grep "durationMs" app.js
+                    grep "controlled_error_test_triggered" app.js
+                    grep "X-Request-Id" ../frontend/nginx.conf
+
+                    echo "Day 34 logging code validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 Compose Health Dependency') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 34 Docker Compose health dependency..."
+
+                    grep "condition: service_healthy" docker-compose.yml
+                    grep "healthcheck:" docker-compose.yml
+                    grep "day34-backend:" docker-compose.yml
+                    grep "http://127.0.0.1:3000/health" docker-compose.yml
+
+                    if grep -q "broken-health" docker-compose.yml; then
+                      echo "Day 34 docker-compose.yml contains broken-health."
+                      exit 1
+                    fi
+
+                    echo "Rendering Day 34 Compose config to confirm final healthcheck URL..."
+                    docker compose config | grep "http://127.0.0.1:3000/health"
+
+                    if docker compose config | grep -q "broken-health"; then
+                      echo "Rendered Day 34 Compose config contains broken-health."
+                      exit 1
+                    fi
+
+                    echo "Day 34 Compose health dependency validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 34 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Testing that Day 34 backend fails fast without required environment variables..."
+
+                    set +e
+                    node app.js > day34-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day34-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 34 backend unexpectedly started without required environment variables."
+                      rm -f day34-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day34-missing-env.log
+                    grep "LOG_LEVEL" day34-missing-env.log
+
+                    rm -f day34-missing-env.log
+
+                    echo "Day 34 backend correctly fails when required environment variables are missing."
+                    '''
+                }
+            }
+        }
+
+        stage('Render Day 34 Docker Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Rendering Day 34 Docker Compose config with .env values..."
+                    docker compose config
+
+                    echo "Day 34 Docker Compose config rendered successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 34 Docker Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Building Day 34 Docker images without cache..."
+                    docker compose build --no-cache
+
+                    echo "Day 34 Docker images built successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 34 With Docker Compose') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old Day 34 containers if they exist..."
+                    docker compose down || true
+
+                    echo "Starting Day 34 application..."
+                    docker compose up -d
+
+                    echo "Current Day 34 containers:"
+                    docker ps --filter "name=day34_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 34 Frontend Waited for Backend Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Verifying Day 34 dependency behavior..."
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 34 backend health: $BACKEND_HEALTH"
+                    echo "Day 34 frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      echo "Day 34 backend is not healthy."
+                      docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      echo "Day 34 frontend is not running."
+                      docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "Day 34 frontend is running after backend became healthy."
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test Day 34 Backend Health') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 backend health endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-health-smoke' http://127.0.0.1:3000/health")
+
+                echo "Day 34 backend health response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"status":"ok"'
+                echo "$RESPONSE" | grep '"service":"day34-backend"'
+                echo "$RESPONSE" | grep '"environment":"day34-env-file"'
+                echo "$RESPONSE" | grep '"version":"day34-v1"'
+
+                echo "Day 34 backend health smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 34 Backend Ready') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 backend readiness endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-ready-smoke' http://127.0.0.1:3000/ready")
+
+                echo "Day 34 backend ready response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"ready":true'
+                echo "$RESPONSE" | grep '"service":"day34-backend"'
+
+                echo "Day 34 backend readiness smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 34 Backend API') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 backend API endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-api-smoke' http://127.0.0.1:3000/api/message")
+
+                echo "Day 34 backend API response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'Hello from Day 34 backend API'
+                echo "$RESPONSE" | grep '"service":"day34-backend"'
+                echo "$RESPONSE" | grep '"environment":"day34-env-file"'
+                echo "$RESPONSE" | grep '"featureFlag":"enabled"'
+                echo "$RESPONSE" | grep '"requestId":"day34-api-smoke"'
+
+                echo "Day 34 backend API smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 34 Runtime Config') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 runtime config endpoint..."
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-config-smoke' http://127.0.0.1:3000/api/config")
+
+                echo "Day 34 runtime config response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day34-backend"'
+                echo "$RESPONSE" | grep '"environment":"day34-env-file"'
+                echo "$RESPONSE" | grep '"version":"day34-v1"'
+                echo "$RESPONSE" | grep '"featureFlag":"enabled"'
+                echo "$RESPONSE" | grep '"logLevel":"info"'
+                echo "$RESPONSE" | grep '"port":3000'
+                echo "$RESPONSE" | grep '"requestId":"day34-config-smoke"'
+
+                echo "Day 34 runtime config smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 34 Controlled Error Logging') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 controlled error endpoint..."
+
+                set +e
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-error-smoke' http://127.0.0.1:3000/api/error-test" 2>/dev/null)
+                EXIT_CODE=$?
+                set -e
+
+                echo "Day 34 controlled error response:"
+                echo "$RESPONSE"
+
+                if [ "$EXIT_CODE" -eq 0 ]; then
+                  echo "Day 34 error-test unexpectedly returned success."
+                  exit 1
+                fi
+
+                echo "$RESPONSE" | grep 'Day 34 controlled error test'
+                echo "$RESPONSE" | grep '"requestId":"day34-error-smoke"'
+
+                echo "Day 34 controlled error endpoint behaved as expected."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 34 Frontend Page') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 frontend page..."
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "Day 34 frontend page response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'DevOps Day 34'
+                echo "$RESPONSE" | grep 'request logging'
+
+                echo "Day 34 frontend page smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 34 Frontend API Proxy') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Smoke testing Day 34 frontend-to-backend proxy..."
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day34-proxy-smoke' http://127.0.0.1/api/config")
+
+                echo "Day 34 frontend proxy config response:"
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day34-backend"'
+                echo "$RESPONSE" | grep '"environment":"day34-env-file"'
+                echo "$RESPONSE" | grep '"version":"day34-v1"'
+                echo "$RESPONSE" | grep '"featureFlag":"enabled"'
+                echo "$RESPONSE" | grep '"requestId":"day34-proxy-smoke"'
+
+                echo "Day 34 frontend API proxy smoke test passed."
+                '''
+            }
+        }
+
+        stage('Verify Day 34 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Verifying Day 34 backend logs contain useful request evidence..."
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day34-api-smoke'
+                echo "$LOGS" | grep 'day34-config-smoke'
+                echo "$LOGS" | grep 'day34-proxy-smoke'
+                echo "$LOGS" | grep 'controlled_error_test_triggered'
+                echo "$LOGS" | grep '"statusCode":200'
+                echo "$LOGS" | grep '"statusCode":500'
+
+                echo "Day 34 backend logs contain request IDs, request completion logs, and error evidence."
+                '''
+            }
+        }
+
+        stage('Show Day 34 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 34 Docker Compose service status:"
+                    docker compose ps
+
+                    echo "Day 34 containers:"
+                    docker ps -a --filter "name=day34_"
+
+                    echo "Day 34 backend health status:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                    echo "Recent Day 34 backend logs:"
+                    docker logs --tail=80 "$BACKEND_CONTAINER" || true
+
+                    echo "Recent Day 34 frontend logs:"
+                    docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 34 pipeline completed successfully. Request logging and log verification passed.'
+        }
+
+        failure {
+            echo 'Day 34 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 34 Docker Compose status:"
+                docker compose ps || true
+
+                echo "Final Day 34 container list:"
+                docker ps -a --filter "name=day34_" || true
+
+                echo "Final Day 34 backend running state:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.State.Running}}' || true
+
+                echo "Final Day 34 backend health:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                echo "Final Day 34 frontend running state:"
+                docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' || true
+
+                echo "Final Day 34 backend logs:"
+                docker logs --tail=100 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 34 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
