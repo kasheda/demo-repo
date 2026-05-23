@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DevOps Day 35</title>
+</head>
+<body>
+  <h1>DevOps Day 35</h1>
+  <p>Frontend starts after the Day 35 backend becomes healthy.</p>
+  <p>Day 35 adds application metrics and Jenkins metrics verification.</p>
+
+  <h2>Backend API Message</h2>
+  <pre id="api-message">Loading message...</pre>
+
+  <h2>Backend Runtime Config</h2>
+  <pre id="api-config">Loading config...</pre>
+
+  <h2>Backend Metrics</h2>
+  <pre id="metrics">Loading metrics...</pre>
+
+  <script>
+    fetch('/api/message', {
+      headers: {
+        'X-Request-Id': 'day35-frontend-message-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-message').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-message').textContent =
+          'Failed to reach Day 35 backend API: ' + error;
+      });
+
+    fetch('/api/config', {
+      headers: {
+        'X-Request-Id': 'day35-frontend-config-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-config').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-config').textContent =
+          'Failed to reach Day 35 backend config API: ' + error;
+      });
+
+    fetch('/metrics', {
+      headers: {
+        'X-Request-Id': 'day35-frontend-metrics-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('metrics').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('metrics').textContent =
+          'Failed to reach Day 35 backend metrics: ' + error;
+      });
+  </script>
+</body>
+</html>
