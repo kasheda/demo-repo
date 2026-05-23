@@ -476,33 +476,41 @@ DAY35_METRICS_ENABLED=
             }
         }
 
-        stage('Smoke Test Day 35 Controlled Error Logging') {
-            steps {
-                sh '''
-                set -e
+      stage('Smoke Test Day 35 Controlled Error Logging') {
+    steps {
+        sh '''
+            set -e
+            echo "Smoke testing Day 35 controlled error endpoint..."
 
-                echo "Smoke testing Day 35 controlled error endpoint..."
+            set +e
+            docker exec day35_backend sh -c "wget -qO- --header='X-Request-Id: day35-error-smoke' http://127.0.0.1:3000/api/error-test"
+            EXIT_CODE=$?
+            set -e
 
-                set +e
-                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day35-error-smoke' http://127.0.0.1:3000/api/error-test" 2>/dev/null)
-                EXIT_CODE=$?
-                set -e
+            echo "Day 35 controlled error endpoint exit code: $EXIT_CODE"
 
-                echo "Day 35 controlled error response:"
-                echo "$RESPONSE"
+            if [ "$EXIT_CODE" -eq 0 ]; then
+              echo "Expected controlled error endpoint to return non-zero because it returns HTTP 500."
+              exit 1
+            fi
 
-                if [ "$EXIT_CODE" -eq 0 ]; then
-                  echo "Day 35 error-test unexpectedly returned success."
-                  exit 1
-                fi
+            echo "Checking Day 35 backend logs for controlled error entry..."
 
-                echo "$RESPONSE" | grep 'Day 35 controlled error test'
-                echo "$RESPONSE" | grep '"requestId":"day35-error-smoke"'
+            docker logs day35_backend > day35-backend.log 2>&1
 
-                echo "Day 35 controlled error endpoint behaved as expected."
-                '''
-            }
-        }
+            echo "Captured Day 35 backend logs:"
+            cat day35-backend.log
+
+            grep 'controlled_error_test_triggered' day35-backend.log
+            grep 'day35-error-smoke' day35-backend.log
+            grep 'statusCode":500' day35-backend.log
+
+            rm -f day35-backend.log
+
+            echo "Day 35 controlled error logging smoke test passed."
+        '''
+    }
+}
 
         stage('Smoke Test Day 35 Metrics') {
             steps {
