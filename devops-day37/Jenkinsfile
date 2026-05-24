@@ -1,0 +1,754 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'dev', 'prodlike'],
+            description: 'Choose which Day 37 environment file Jenkins should deploy.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 37'
+        PROJECT_DIR = 'devops-day37'
+        BACKEND_CONTAINER = 'day37_backend'
+        FRONTEND_CONTAINER = 'day37_frontend'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 37...'
+                checkout scm
+            }
+        }
+
+        stage('Select Day 37 Environment File') {
+            steps {
+                script {
+                    if (params.DEPLOY_ENV == 'dev') {
+                        env.ENV_FILE = '.env'
+                        env.EXPECTED_APP_ENV = 'day37-dev-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'dev'
+                        env.EXPECTED_APP_VERSION = 'day37-dev-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8037'
+                    } else if (params.DEPLOY_ENV == 'staging') {
+                        env.ENV_FILE = '.env.staging'
+                        env.EXPECTED_APP_ENV = 'day37-staging-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'staging'
+                        env.EXPECTED_APP_VERSION = 'day37-staging-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8137'
+                    } else if (params.DEPLOY_ENV == 'prodlike') {
+                        env.ENV_FILE = '.env.prodlike'
+                        env.EXPECTED_APP_ENV = 'day37-prodlike-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'prodlike'
+                        env.EXPECTED_APP_VERSION = 'day37-prodlike-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'disabled'
+                        env.EXPECTED_FRONTEND_PORT = '8237'
+                    } else {
+                        error "Unsupported Day 37 DEPLOY_ENV: ${params.DEPLOY_ENV}"
+                    }
+
+                    echo "Day 37 selected DEPLOY_ENV=${params.DEPLOY_ENV}"
+                    echo "Day 37 selected ENV_FILE=${env.ENV_FILE}"
+                }
+            }
+        }
+
+        stage('Validate Day 37 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Validating Day 37 Jenkins runtime tools..."
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+
+                echo "Day 37 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 37 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 required project files..."
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+.env
+.env.staging
+.env.prodlike
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 37 file: $file"
+                        echo "Current Day 37 files:"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 37 file: $file"
+                    done
+
+                    echo "All Day 37 required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 backend JavaScript syntax..."
+                    node --check app.js
+
+                    echo "Day 37 backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Frontend Files') {
+            steps {
+                dir("${PROJECT_DIR}/frontend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 frontend files..."
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    grep "DevOps Day 37" index.html
+                    grep "day37-backend" nginx.conf
+                    grep "X-Request-Id" nginx.conf
+                    grep "/metrics" nginx.conf
+
+                    if grep -q '\\${DAY37' nginx.conf; then
+                      echo "Day 37 nginx.conf should not contain unresolved env placeholders."
+                      exit 1
+                    fi
+
+                    echo "Day 37 frontend files are valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 dev env file..."
+                    grep "DAY37_APP_ENV=day37-dev-env" .env
+                    grep "DAY37_DEPLOY_TARGET=dev" .env
+                    grep "DAY37_APP_VERSION=day37-dev-v1" .env
+                    grep "DAY37_FEATURE_FLAG=enabled" .env
+                    grep "DAY37_FRONTEND_PORT=8037" .env
+
+                    echo "Validating Day 37 staging env file..."
+                    grep "DAY37_APP_ENV=day37-staging-env" .env.staging
+                    grep "DAY37_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY37_APP_VERSION=day37-staging-v1" .env.staging
+                    grep "DAY37_FEATURE_FLAG=enabled" .env.staging
+                    grep "DAY37_FRONTEND_PORT=8137" .env.staging
+
+                    echo "Validating Day 37 prodlike env file..."
+                    grep "DAY37_APP_ENV=day37-prodlike-env" .env.prodlike
+                    grep "DAY37_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY37_APP_VERSION=day37-prodlike-v1" .env.prodlike
+                    grep "DAY37_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY37_FRONTEND_PORT=8237" .env.prodlike
+
+                    echo "Day 37 env file value validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Selected Env File') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating selected Day 37 env file: $ENV_FILE"
+
+                    grep "DAY37_APP_ENV=$EXPECTED_APP_ENV" "$ENV_FILE"
+                    grep "DAY37_DEPLOY_TARGET=$EXPECTED_DEPLOY_TARGET" "$ENV_FILE"
+                    grep "DAY37_APP_VERSION=$EXPECTED_APP_VERSION" "$ENV_FILE"
+                    grep "DAY37_FEATURE_FLAG=$EXPECTED_FEATURE_FLAG" "$ENV_FILE"
+                    grep "DAY37_FRONTEND_PORT=$EXPECTED_FRONTEND_PORT" "$ENV_FILE"
+
+                    echo "Selected Day 37 env file matches DEPLOY_ENV=$DEPLOY_ENV."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Env Example Keys') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 .env.example required keys..."
+
+                    REQUIRED_EXAMPLE_KEYS="
+DAY37_BACKEND_PORT=
+DAY37_FRONTEND_PORT=
+DAY37_APP_ENV=
+DAY37_DEPLOY_TARGET=
+DAY37_APP_VERSION=
+DAY37_SERVICE_NAME=
+DAY37_FEATURE_FLAG=
+DAY37_LOG_LEVEL=
+DAY37_METRICS_ENABLED=
+"
+
+                    for key in $REQUIRED_EXAMPLE_KEYS; do
+                      grep "$key" .env.example
+                      echo "Found Day 37 env example key: $key"
+                    done
+
+                    echo "Day 37 .env.example key validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Checking Day 37 env key drift..."
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day37-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day37-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day37-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day37-env-example-keys.txt
+
+                    if ! diff -u day37-env-example-keys.txt day37-env-keys.txt; then
+                      echo "Day 37 config drift detected between .env.example and .env."
+                      exit 1
+                    fi
+
+                    if ! diff -u day37-env-example-keys.txt day37-staging-env-keys.txt; then
+                      echo "Day 37 config drift detected between .env.example and .env.staging."
+                      exit 1
+                    fi
+
+                    if ! diff -u day37-env-example-keys.txt day37-prodlike-env-keys.txt; then
+                      echo "Day 37 config drift detected between .env.example and .env.prodlike."
+                      exit 1
+                    fi
+
+                    rm -f day37-env-keys.txt day37-staging-env-keys.txt day37-prodlike-env-keys.txt day37-env-example-keys.txt
+
+                    echo "Day 37 env files contain the same keys."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Metrics Code') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 metrics code..."
+
+                    grep "METRICS_ENABLED" app.js
+                    grep "DEPLOY_TARGET" app.js
+                    grep "totalRequests" app.js
+                    grep "requestsByPath" app.js
+                    grep "statusCodes" app.js
+                    grep "uptimeSeconds" app.js
+                    grep "app.get('/metrics'" app.js
+
+                    echo "Day 37 metrics code validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Logging Code') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 logging code..."
+
+                    grep "createRequestId" app.js
+                    grep "request_completed" app.js
+                    grep "durationMs" app.js
+                    grep "controlled_error_test_triggered" app.js
+                    grep "X-Request-Id" ../frontend/nginx.conf
+
+                    echo "Day 37 logging code validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 Compose Health Dependency') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 37 Docker Compose health dependency..."
+
+                    grep "condition: service_healthy" docker-compose.yml
+                    grep "healthcheck:" docker-compose.yml
+                    grep "day37-backend:" docker-compose.yml
+                    grep "http://127.0.0.1:3000/health" docker-compose.yml
+
+                    if grep -q "broken-health" docker-compose.yml; then
+                      echo "Day 37 docker-compose.yml contains broken-health."
+                      exit 1
+                    fi
+
+                    echo "Rendering Day 37 Compose config using selected env file..."
+                    docker compose --env-file "$ENV_FILE" config
+
+                    docker compose --env-file "$ENV_FILE" config | grep "$EXPECTED_APP_ENV"
+                    docker compose --env-file "$ENV_FILE" config | grep "$EXPECTED_DEPLOY_TARGET"
+                    docker compose --env-file "$ENV_FILE" config | grep "http://127.0.0.1:3000/health"
+
+                    if docker compose --env-file "$ENV_FILE" config | grep -q "broken-health"; then
+                      echo "Rendered Day 37 Compose config contains broken-health."
+                      exit 1
+                    fi
+
+                    echo "Day 37 Compose health dependency validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 37 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Testing that Day 37 backend fails fast without required environment variables..."
+
+                    set +e
+                    node app.js > day37-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day37-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 37 backend unexpectedly started without required environment variables."
+                      rm -f day37-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day37-missing-env.log
+                    grep "DEPLOY_TARGET" day37-missing-env.log
+
+                    rm -f day37-missing-env.log
+
+                    echo "Day 37 backend correctly fails when required environment variables are missing."
+                    '''
+                }
+            }
+        }
+
+        stage('Render Day 37 Docker Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Rendering Day 37 Docker Compose config with selected env file: $ENV_FILE"
+                    docker compose --env-file "$ENV_FILE" config
+
+                    echo "Day 37 Docker Compose config rendered successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 37 Docker Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Building Day 37 Docker images without cache..."
+                    docker compose --env-file "$ENV_FILE" build --no-cache
+
+                    echo "Day 37 Docker images built successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 37 With Selected Env File') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old Day 37 containers if they exist..."
+                    docker compose --env-file "$ENV_FILE" down || true
+
+                    echo "Starting Day 37 application using env file: $ENV_FILE"
+                    docker compose --env-file "$ENV_FILE" up -d
+
+                    echo "Current Day 37 containers:"
+                    docker ps --filter "name=day37_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 37 Frontend Waited for Backend Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Verifying Day 37 dependency behavior..."
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 37 backend health: $BACKEND_HEALTH"
+                    echo "Day 37 frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      echo "Day 37 backend is not healthy."
+                      docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      echo "Day 37 frontend is not running."
+                      docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "Day 37 frontend is running after backend became healthy."
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test Day 37 Backend Health') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-health-smoke' http://127.0.0.1:3000/health")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"status":"ok"'
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"version\\":\\"$EXPECTED_APP_VERSION\\""
+
+                echo "Day 37 backend health smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Backend Ready') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-ready-smoke' http://127.0.0.1:3000/ready")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"ready":true'
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+
+                echo "Day 37 backend readiness smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Backend API') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-api-smoke' http://127.0.0.1:3000/api/message")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'Hello from Day 37 backend API'
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"featureFlag\\":\\"$EXPECTED_FEATURE_FLAG\\""
+                echo "$RESPONSE" | grep '"requestId":"day37-api-smoke"'
+
+                echo "Day 37 backend API smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Runtime Config') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-config-smoke' http://127.0.0.1:3000/api/config")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"version\\":\\"$EXPECTED_APP_VERSION\\""
+                echo "$RESPONSE" | grep "\\"featureFlag\\":\\"$EXPECTED_FEATURE_FLAG\\""
+                echo "$RESPONSE" | grep '"logLevel":"info"'
+                echo "$RESPONSE" | grep '"metricsEnabled":true'
+                echo "$RESPONSE" | grep '"port":3000'
+                echo "$RESPONSE" | grep '"requestId":"day37-config-smoke"'
+
+                echo "Day 37 runtime config smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Controlled Error Logging') {
+            steps {
+                sh '''
+                set -e
+
+                set +e
+                docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-error-smoke' http://127.0.0.1:3000/api/error-test"
+                EXIT_CODE=$?
+                set -e
+
+                if [ "$EXIT_CODE" -eq 0 ]; then
+                  echo "Day 37 error-test unexpectedly returned success."
+                  exit 1
+                fi
+
+                echo "Day 37 controlled error endpoint returned failure as expected."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Metrics') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-metrics-smoke' http://127.0.0.1:3000/metrics")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep '"metricsEnabled":true'
+                echo "$RESPONSE" | grep '"totalRequests"'
+                echo "$RESPONSE" | grep '"requestsByPath"'
+                echo "$RESPONSE" | grep '"statusCodes"'
+                echo "$RESPONSE" | grep '"/api/message"'
+                echo "$RESPONSE" | grep '"/api/config"'
+                echo "$RESPONSE" | grep '"/api/error-test"'
+                echo "$RESPONSE" | grep '"200"'
+                echo "$RESPONSE" | grep '"500"'
+
+                echo "Day 37 metrics smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Frontend Page') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'DevOps Day 37'
+                echo "$RESPONSE" | grep 'Jenkins parameterized environment selection'
+
+                echo "Day 37 frontend page smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Frontend API Proxy') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-proxy-smoke' http://127.0.0.1/api/config")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"version\\":\\"$EXPECTED_APP_VERSION\\""
+                echo "$RESPONSE" | grep '"requestId":"day37-proxy-smoke"'
+
+                echo "Day 37 frontend API proxy smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 37 Frontend Metrics Proxy') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day37-proxy-metrics-smoke' http://127.0.0.1/metrics")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day37-backend"'
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep '"metricsEnabled":true'
+                echo "$RESPONSE" | grep '"totalRequests"'
+
+                echo "Day 37 frontend metrics proxy smoke test passed."
+                '''
+            }
+        }
+
+        stage('Verify Day 37 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day37-api-smoke'
+                echo "$LOGS" | grep 'day37-config-smoke'
+                echo "$LOGS" | grep 'day37-proxy-smoke'
+                echo "$LOGS" | grep 'day37-metrics-smoke'
+                echo "$LOGS" | grep 'controlled_error_test_triggered'
+                echo "$LOGS" | grep '"statusCode":200'
+                echo "$LOGS" | grep '"statusCode":500'
+                echo "$LOGS" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+
+                echo "Day 37 backend logs contain request IDs, deployment target, metrics requests, and error evidence."
+                '''
+            }
+        }
+
+        stage('Show Day 37 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 37 selected DEPLOY_ENV: $DEPLOY_ENV"
+                    echo "Day 37 selected ENV_FILE: $ENV_FILE"
+
+                    echo "Day 37 Docker Compose service status:"
+                    docker compose --env-file "$ENV_FILE" ps
+
+                    echo "Day 37 containers:"
+                    docker ps -a --filter "name=day37_"
+
+                    echo "Day 37 backend health status:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                    echo "Recent Day 37 backend logs:"
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                    echo "Recent Day 37 frontend logs:"
+                    docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 37 pipeline completed successfully. Parameterized environment deployment passed.'
+        }
+
+        failure {
+            echo 'Day 37 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 37 selected DEPLOY_ENV:"
+                echo "$DEPLOY_ENV"
+
+                echo "Final Day 37 selected ENV_FILE:"
+                echo "$ENV_FILE"
+
+                echo "Final Day 37 Docker Compose status:"
+                docker compose --env-file "$ENV_FILE" ps || true
+
+                echo "Final Day 37 container list:"
+                docker ps -a --filter "name=day37_" || true
+
+                echo "Final Day 37 backend running state:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.State.Running}}' || true
+
+                echo "Final Day 37 backend health:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                echo "Final Day 37 frontend running state:"
+                docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' || true
+
+                echo "Final Day 37 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 37 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
