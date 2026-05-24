@@ -1,0 +1,36 @@
+name: devops-day36
+services:
+  day36-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: day36_backend
+    environment:
+      PORT: ${DAY36_BACKEND_PORT}
+      APP_ENV: ${DAY36_APP_ENV}
+      APP_VERSION: ${DAY36_APP_VERSION}
+      FEATURE_FLAG: ${DAY36_FEATURE_FLAG}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:${DAY36_BACKEND_PORT}/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    ports:
+      - "${DAY36_BACKEND_PORT}:${DAY36_BACKEND_PORT}"
+    restart: unless-stopped
+
+  day36-frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: day36_frontend
+    depends_on:
+      day36-backend:
+        condition: service_healthy
+    environment:
+      DAY36_BACKEND_HOST: ${DAY36_BACKEND_HOST}
+      DAY36_BACKEND_PORT: ${DAY36_BACKEND_PORT}
+    ports:
+      - "${DAY36_FRONTEND_PORT}:80"
+    restart: unless-stopped

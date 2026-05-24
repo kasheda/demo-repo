@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>DevOps Day 36</title>
+</head>
+<body>
+  <h1>DevOps Day 36</h1>
+  <p>Frontend running with backend API: <span id="api-message">loading...</span></p>
+  <script>
+    fetch('/api/message')
+      .then(res => res.json())
+      .then(data => document.getElementById('api-message').textContent = data.message)
+      .catch(err => document.getElementById('api-message').textContent = 'Error fetching API');
+  </script>
+</body>
+</html>
