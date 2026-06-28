@@ -375,7 +375,18 @@ README.md
                     echo "Testing that Day 38 backend fails fast without required environment variables..."
 
                     set +e
-                    node app.js > day38-missing-env.log 2>&1
+                    env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day38-missing-env.log 2>&1
                     EXIT_CODE=$?
                     set -e
 
