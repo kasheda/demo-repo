@@ -1,0 +1,844 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'dev', 'prodlike'],
+            description: 'Choose which Day 39 environment Jenkins should deploy.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 39'
+        PROJECT_DIR = 'devops-day39'
+        RUNTIME_ENV_FILE = '.env.runtime'
+        BACKEND_CONTAINER = 'day39_backend'
+        FRONTEND_CONTAINER = 'day39_frontend'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 39...'
+                checkout scm
+            }
+        }
+
+        stage('Select Day 39 Environment File') {
+            steps {
+                script {
+                    if (params.DEPLOY_ENV == 'dev') {
+                        env.BASE_ENV_FILE = '.env'
+                        env.EXPECTED_APP_ENV = 'day39-dev-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'dev'
+                        env.EXPECTED_APP_VERSION = 'day39-dev-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8039'
+                    } else if (params.DEPLOY_ENV == 'staging') {
+                        env.BASE_ENV_FILE = '.env.staging'
+                        env.EXPECTED_APP_ENV = 'day39-staging-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'staging'
+                        env.EXPECTED_APP_VERSION = 'day39-staging-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8139'
+                    } else if (params.DEPLOY_ENV == 'prodlike') {
+                        env.BASE_ENV_FILE = '.env.prodlike'
+                        env.EXPECTED_APP_ENV = 'day39-prodlike-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'prodlike'
+                        env.EXPECTED_APP_VERSION = 'day39-prodlike-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'disabled'
+                        env.EXPECTED_FRONTEND_PORT = '8239'
+                    } else {
+                        error "Unsupported Day 39 DEPLOY_ENV: ${params.DEPLOY_ENV}"
+                    }
+
+                    echo "Day 39 selected DEPLOY_ENV=${params.DEPLOY_ENV}"
+                    echo "Day 39 selected BASE_ENV_FILE=${env.BASE_ENV_FILE}"
+                }
+            }
+        }
+
+        stage('Validate Day 39 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Validating Day 39 Jenkins runtime tools..."
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+
+                echo "Day 39 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 39 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 39 required project files..."
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+.env
+.env.staging
+.env.prodlike
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 39 file: $file"
+                        echo "Current Day 39 files:"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 39 file: $file"
+                    done
+
+                    echo "All Day 39 required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 39 Runtime Env File') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Generating Day 39 runtime env file from $BASE_ENV_FILE..."
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    IMAGE_TAG="day39-${DEPLOY_ENV}-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    grep -v '^DAY39_BUILD_NUMBER=' "$BASE_ENV_FILE" \
+                      | grep -v '^DAY39_GIT_COMMIT=' \
+                      | grep -v '^DAY39_IMAGE_TAG=' \
+                      | grep -v '^DAY39_RELEASE_CREATED_AT=' > "$RUNTIME_ENV_FILE"
+
+                    {
+                      echo "DAY39_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY39_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY39_IMAGE_TAG=$IMAGE_TAG"
+                      echo "DAY39_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                    } >> "$RUNTIME_ENV_FILE"
+
+                    echo "Day 39 runtime env file:"
+                    cat "$RUNTIME_ENV_FILE"
+
+                    echo "DAY39_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day39-build-metadata.env
+                    echo "DAY39_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day39-build-metadata.env
+                    echo "DAY39_EXPECTED_IMAGE_TAG=$IMAGE_TAG" >> day39-build-metadata.env
+                    echo "DAY39_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day39-build-metadata.env
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 39 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(
+                            returnStdout: true,
+                            script: ". ./day39-build-metadata.env && echo \$DAY39_EXPECTED_BUILD_NUMBER"
+                        ).trim()
+
+                        env.EXPECTED_GIT_COMMIT = sh(
+                            returnStdout: true,
+                            script: ". ./day39-build-metadata.env && echo \$DAY39_EXPECTED_GIT_COMMIT"
+                        ).trim()
+
+                        env.EXPECTED_IMAGE_TAG = sh(
+                            returnStdout: true,
+                            script: ". ./day39-build-metadata.env && echo \$DAY39_EXPECTED_IMAGE_TAG"
+                        ).trim()
+
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(
+                            returnStdout: true,
+                            script: ". ./day39-build-metadata.env && echo \$DAY39_EXPECTED_RELEASE_CREATED_AT"
+                        ).trim()
+
+                        echo "Day 39 expected build number: ${env.EXPECTED_BUILD_NUMBER}"
+                        echo "Day 39 expected git commit: ${env.EXPECTED_GIT_COMMIT}"
+                        echo "Day 39 expected image tag: ${env.EXPECTED_IMAGE_TAG}"
+                        echo "Day 39 expected release created at: ${env.EXPECTED_RELEASE_CREATED_AT}"
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 39 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 39 backend JavaScript syntax..."
+                    node --check app.js
+
+                    echo "Day 39 backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 Frontend Files') {
+            steps {
+                dir("${PROJECT_DIR}/frontend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 39 frontend files..."
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    grep "DevOps Day 39" index.html
+                    grep "day39-backend" nginx.conf
+                    grep "X-Request-Id" nginx.conf
+                    grep "/metrics" nginx.conf
+                    grep "/api/version" index.html
+                    grep "/api/release" index.html
+
+                    if grep -q '\\${DAY39' nginx.conf; then
+                      echo "Day 39 nginx.conf should not contain unresolved env placeholders."
+                      exit 1
+                    fi
+
+                    echo "Day 39 frontend files are valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 39 dev env file..."
+                    grep "DAY39_APP_ENV=day39-dev-env" .env
+                    grep "DAY39_DEPLOY_TARGET=dev" .env
+                    grep "DAY39_APP_VERSION=day39-dev-v1" .env
+                    grep "DAY39_FEATURE_FLAG=enabled" .env
+                    grep "DAY39_FRONTEND_PORT=8039" .env
+
+                    echo "Validating Day 39 staging env file..."
+                    grep "DAY39_APP_ENV=day39-staging-env" .env.staging
+                    grep "DAY39_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY39_APP_VERSION=day39-staging-v1" .env.staging
+                    grep "DAY39_FEATURE_FLAG=enabled" .env.staging
+                    grep "DAY39_FRONTEND_PORT=8139" .env.staging
+
+                    echo "Validating Day 39 prodlike env file..."
+                    grep "DAY39_APP_ENV=day39-prodlike-env" .env.prodlike
+                    grep "DAY39_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY39_APP_VERSION=day39-prodlike-v1" .env.prodlike
+                    grep "DAY39_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY39_FRONTEND_PORT=8239" .env.prodlike
+
+                    echo "Day 39 env file value validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 Selected Runtime Env File') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating selected Day 39 runtime env file: $RUNTIME_ENV_FILE"
+
+                    grep "DAY39_APP_ENV=$EXPECTED_APP_ENV" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_DEPLOY_TARGET=$EXPECTED_DEPLOY_TARGET" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_APP_VERSION=$EXPECTED_APP_VERSION" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_FEATURE_FLAG=$EXPECTED_FEATURE_FLAG" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_FRONTEND_PORT=$EXPECTED_FRONTEND_PORT" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_BUILD_NUMBER=$EXPECTED_BUILD_NUMBER" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_GIT_COMMIT=$EXPECTED_GIT_COMMIT" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_IMAGE_TAG=$EXPECTED_IMAGE_TAG" "$RUNTIME_ENV_FILE"
+                    grep "DAY39_RELEASE_CREATED_AT=$EXPECTED_RELEASE_CREATED_AT" "$RUNTIME_ENV_FILE"
+
+                    echo "Selected Day 39 runtime env file matches DEPLOY_ENV=$DEPLOY_ENV."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Checking Day 39 env key drift..."
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day39-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day39-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day39-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day39-env-example-keys.txt
+
+                    diff -u day39-env-example-keys.txt day39-env-keys.txt
+                    diff -u day39-env-example-keys.txt day39-staging-env-keys.txt
+                    diff -u day39-env-example-keys.txt day39-prodlike-env-keys.txt
+
+                    rm -f day39-env-keys.txt day39-staging-env-keys.txt day39-prodlike-env-keys.txt day39-env-example-keys.txt
+
+                    echo "Day 39 env files contain the same keys."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 Release Manifest Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 39 release manifest code..."
+
+                    grep "release.json" backend/Dockerfile
+                    grep "DAY39_RELEASE_CREATED_AT" backend/Dockerfile
+                    grep "readReleaseManifest" backend/app.js
+                    grep "releaseManifestMatchesRuntime" backend/app.js
+                    grep "app.get('/api/release'" backend/app.js
+                    grep "RELEASE_CREATED_AT" backend/app.js
+
+                    echo "Day 39 release manifest code validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 39 Docker Compose config..."
+
+                    grep "condition: service_healthy" docker-compose.yml
+                    grep "healthcheck:" docker-compose.yml
+                    grep "day39-backend:" docker-compose.yml
+                    grep "day39-backend:\\${DAY39_IMAGE_TAG}" docker-compose.yml
+                    grep "day39-frontend:\\${DAY39_IMAGE_TAG}" docker-compose.yml
+                    grep "DAY39_RELEASE_CREATED_AT" docker-compose.yml
+                    grep "args:" docker-compose.yml
+                    grep "http://127.0.0.1:3000/health" docker-compose.yml
+
+                    if grep -q "broken-health" docker-compose.yml; then
+                      echo "Day 39 docker-compose.yml contains broken-health."
+                      exit 1
+                    fi
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "$EXPECTED_APP_ENV"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "$EXPECTED_DEPLOY_TARGET"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "$EXPECTED_IMAGE_TAG"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "$EXPECTED_RELEASE_CREATED_AT"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "http://127.0.0.1:3000/health"
+
+                    echo "Day 39 Compose validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 39 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Testing that Day 39 backend fails fast without required environment variables..."
+
+                    set +e
+                    node app.js > day39-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day39-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 39 backend unexpectedly started without required environment variables."
+                      rm -f day39-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day39-missing-env.log
+                    grep "BUILD_NUMBER" day39-missing-env.log
+                    grep "GIT_COMMIT" day39-missing-env.log
+                    grep "IMAGE_TAG" day39-missing-env.log
+                    grep "RELEASE_CREATED_AT" day39-missing-env.log
+
+                    rm -f day39-missing-env.log
+
+                    echo "Day 39 backend correctly fails when required environment variables are missing."
+                    '''
+                }
+            }
+        }
+
+        stage('Render Day 39 Docker Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Rendering Day 39 Docker Compose config with runtime env file: $RUNTIME_ENV_FILE"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config
+
+                    echo "Day 39 Docker Compose config rendered successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 39 Docker Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Building Day 39 Docker images with tag: $EXPECTED_IMAGE_TAG"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" build --no-cache
+
+                    echo "Inspecting release manifest inside built backend image..."
+                    docker run --rm "day39-backend:$EXPECTED_IMAGE_TAG" cat /app/release.json | tee day39-release-from-image.json
+
+                    grep "\\"service\\": \\"day39-backend\\"" day39-release-from-image.json
+                    grep "\\"deployTarget\\": \\"$EXPECTED_DEPLOY_TARGET\\"" day39-release-from-image.json
+                    grep "\\"appVersion\\": \\"$EXPECTED_APP_VERSION\\"" day39-release-from-image.json
+                    grep "\\"buildNumber\\": \\"$EXPECTED_BUILD_NUMBER\\"" day39-release-from-image.json
+                    grep "\\"gitCommit\\": \\"$EXPECTED_GIT_COMMIT\\"" day39-release-from-image.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_IMAGE_TAG\\"" day39-release-from-image.json
+                    grep "\\"releaseCreatedAt\\": \\"$EXPECTED_RELEASE_CREATED_AT\\"" day39-release-from-image.json
+
+                    rm -f day39-release-from-image.json
+
+                    echo "Day 39 Docker images built and release manifest verified successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 39 With Runtime Env File') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old Day 39 containers if they exist..."
+                    docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+
+                    echo "Starting Day 39 application using runtime env file: $RUNTIME_ENV_FILE"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" up -d
+
+                    echo "Current Day 39 containers:"
+                    docker ps --filter "name=day39_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 39 Frontend Waited for Backend Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 39 backend health: $BACKEND_HEALTH"
+                    echo "Day 39 frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "Day 39 frontend is running after backend became healthy."
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test Day 39 Backend Health') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-health-smoke' http://127.0.0.1:3000/health")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"status":"ok"'
+                echo "$RESPONSE" | grep '"service":"day39-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"version\\":\\"$EXPECTED_APP_VERSION\\""
+                echo "$RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                echo "$RESPONSE" | grep "\\"buildNumber\\":\\"$EXPECTED_BUILD_NUMBER\\""
+                echo "$RESPONSE" | grep "\\"gitCommit\\":\\"$EXPECTED_GIT_COMMIT\\""
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$RESPONSE" | grep "\\"releaseCreatedAt\\":\\"$EXPECTED_RELEASE_CREATED_AT\\""
+
+                echo "Day 39 backend health smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Version Endpoint') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-version-smoke' http://127.0.0.1:3000/api/version")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day39-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"appVersion\\":\\"$EXPECTED_APP_VERSION\\""
+                echo "$RESPONSE" | grep "\\"buildNumber\\":\\"$EXPECTED_BUILD_NUMBER\\""
+                echo "$RESPONSE" | grep "\\"gitCommit\\":\\"$EXPECTED_GIT_COMMIT\\""
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$RESPONSE" | grep "\\"releaseCreatedAt\\":\\"$EXPECTED_RELEASE_CREATED_AT\\""
+                echo "$RESPONSE" | grep '"requestId":"day39-version-smoke"'
+
+                echo "Day 39 version endpoint smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Release Endpoint') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-release-smoke' http://127.0.0.1:3000/api/release")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day39-backend"'
+                echo "$RESPONSE" | grep '"runtimeMetadata"'
+                echo "$RESPONSE" | grep '"imageReleaseManifest"'
+                echo "$RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"buildNumber\\":\\"$EXPECTED_BUILD_NUMBER\\""
+                echo "$RESPONSE" | grep "\\"gitCommit\\":\\"$EXPECTED_GIT_COMMIT\\""
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$RESPONSE" | grep "\\"releaseCreatedAt\\":\\"$EXPECTED_RELEASE_CREATED_AT\\""
+                echo "$RESPONSE" | grep '"requestId":"day39-release-smoke"'
+
+                echo "Day 39 release endpoint smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Backend API') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-api-smoke' http://127.0.0.1:3000/api/message")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'Hello from Day 39 backend API'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"featureFlag\\":\\"$EXPECTED_FEATURE_FLAG\\""
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+
+                echo "Day 39 backend API smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Runtime Config') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-config-smoke' http://127.0.0.1:3000/api/config")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day39-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep "\\"version\\":\\"$EXPECTED_APP_VERSION\\""
+                echo "$RESPONSE" | grep "\\"featureFlag\\":\\"$EXPECTED_FEATURE_FLAG\\""
+                echo "$RESPONSE" | grep '"metricsEnabled":true'
+                echo "$RESPONSE" | grep "\\"buildNumber\\":\\"$EXPECTED_BUILD_NUMBER\\""
+                echo "$RESPONSE" | grep "\\"gitCommit\\":\\"$EXPECTED_GIT_COMMIT\\""
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+
+                echo "Day 39 runtime config smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Controlled Error') {
+            steps {
+                sh '''
+                set -e
+
+                set +e
+                docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-error-smoke' http://127.0.0.1:3000/api/error-test"
+                EXIT_CODE=$?
+                set -e
+
+                if [ "$EXIT_CODE" -eq 0 ]; then
+                  echo "Day 39 error-test unexpectedly returned success."
+                  exit 1
+                fi
+
+                echo "Day 39 controlled error endpoint returned failure as expected."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Metrics') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-metrics-smoke' http://127.0.0.1:3000/metrics")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day39-backend"'
+                echo "$RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$RESPONSE" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$RESPONSE" | grep '"metricsEnabled":true'
+                echo "$RESPONSE" | grep '"totalRequests"'
+                echo "$RESPONSE" | grep '"requestsByPath"'
+                echo "$RESPONSE" | grep '"statusCodes"'
+                echo "$RESPONSE" | grep '"/api/version"'
+                echo "$RESPONSE" | grep '"/api/release"'
+                echo "$RESPONSE" | grep '"/api/message"'
+                echo "$RESPONSE" | grep '"/api/config"'
+                echo "$RESPONSE" | grep '"/api/error-test"'
+                echo "$RESPONSE" | grep '"200"'
+                echo "$RESPONSE" | grep '"500"'
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+
+                echo "Day 39 metrics smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Frontend Page') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep 'DevOps Day 39'
+                echo "$RESPONSE" | grep 'image-baked release manifest'
+                echo "$RESPONSE" | grep 'Backend Release Manifest'
+
+                echo "Day 39 frontend page smoke test passed."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 39 Frontend Release Proxy') {
+            steps {
+                sh '''
+                set -e
+
+                RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day39-proxy-release-smoke' http://127.0.0.1/api/release")
+
+                echo "$RESPONSE"
+
+                echo "$RESPONSE" | grep '"service":"day39-backend"'
+                echo "$RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                echo "$RESPONSE" | grep "\\"gitCommit\\":\\"$EXPECTED_GIT_COMMIT\\""
+                echo "$RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+
+                echo "Day 39 frontend release proxy smoke test passed."
+                '''
+            }
+        }
+
+        stage('Verify Day 39 Container Image and Manifest') {
+            steps {
+                sh '''
+                set -e
+
+                BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "Day 39 backend image: $BACKEND_IMAGE"
+                echo "Day 39 frontend image: $FRONTEND_IMAGE"
+
+                echo "$BACKEND_IMAGE" | grep "day39-backend:$EXPECTED_IMAGE_TAG"
+                echo "$FRONTEND_IMAGE" | grep "day39-frontend:$EXPECTED_IMAGE_TAG"
+
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json | tee day39-running-release.json
+
+                grep "\\"deployTarget\\": \\"$EXPECTED_DEPLOY_TARGET\\"" day39-running-release.json
+                grep "\\"appVersion\\": \\"$EXPECTED_APP_VERSION\\"" day39-running-release.json
+                grep "\\"buildNumber\\": \\"$EXPECTED_BUILD_NUMBER\\"" day39-running-release.json
+                grep "\\"gitCommit\\": \\"$EXPECTED_GIT_COMMIT\\"" day39-running-release.json
+                grep "\\"imageTag\\": \\"$EXPECTED_IMAGE_TAG\\"" day39-running-release.json
+                grep "\\"releaseCreatedAt\\": \\"$EXPECTED_RELEASE_CREATED_AT\\"" day39-running-release.json
+
+                rm -f day39-running-release.json
+
+                echo "Day 39 running container image and release manifest verified."
+                '''
+            }
+        }
+
+        stage('Verify Day 39 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day39-api-smoke'
+                echo "$LOGS" | grep 'day39-config-smoke'
+                echo "$LOGS" | grep 'day39-version-smoke'
+                echo "$LOGS" | grep 'day39-release-smoke'
+                echo "$LOGS" | grep 'controlled_error_test_triggered'
+                echo "$LOGS" | grep '"statusCode":200'
+                echo "$LOGS" | grep '"statusCode":500'
+                echo "$LOGS" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+                echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$LOGS" | grep "\\"releaseCreatedAt\\":\\"$EXPECTED_RELEASE_CREATED_AT\\""
+
+                echo "Day 39 backend logs contain request IDs, release metadata, image tag, and error evidence."
+                '''
+            }
+        }
+
+        stage('Show Day 39 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 39 selected DEPLOY_ENV: $DEPLOY_ENV"
+                    echo "Day 39 base env file: $BASE_ENV_FILE"
+                    echo "Day 39 runtime env file: $RUNTIME_ENV_FILE"
+                    echo "Day 39 expected image tag: $EXPECTED_IMAGE_TAG"
+                    echo "Day 39 expected release created at: $EXPECTED_RELEASE_CREATED_AT"
+
+                    echo "Day 39 Docker Compose service status:"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" ps
+
+                    echo "Day 39 containers:"
+                    docker ps -a --filter "name=day39_"
+
+                    echo "Day 39 backend image:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                    echo "Day 39 frontend image:"
+                    docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                    echo "Day 39 backend release manifest:"
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                    echo "Day 39 backend health status:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                    echo "Recent Day 39 backend logs:"
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                    echo "Recent Day 39 frontend logs:"
+                    docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 39 pipeline completed successfully. Image-baked release manifest verification passed.'
+        }
+
+        failure {
+            echo 'Day 39 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 39 selected DEPLOY_ENV:"
+                echo "$DEPLOY_ENV"
+
+                echo "Final Day 39 runtime env file:"
+                echo "$RUNTIME_ENV_FILE"
+
+                echo "Final Day 39 Docker Compose status:"
+                docker compose --env-file "$RUNTIME_ENV_FILE" ps || true
+
+                echo "Final Day 39 container list:"
+                docker ps -a --filter "name=day39_" || true
+
+                echo "Final Day 39 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 39 frontend image:"
+                docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 39 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 39 backend health:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' || true
+
+                echo "Final Day 39 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 39 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
