@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DevOps Day 38</title>
+</head>
+<body>
+  <h1>DevOps Day 38</h1>
+  <p>Frontend starts after the Day 38 backend becomes healthy.</p>
+  <p>Day 38 adds Jenkins build metadata, Git commit, and image tag verification.</p>
+
+  <h2>Backend API Message</h2>
+  <pre id="api-message">Loading message...</pre>
+
+  <h2>Backend Runtime Config</h2>
+  <pre id="api-config">Loading config...</pre>
+
+  <h2>Backend Version</h2>
+  <pre id="api-version">Loading version...</pre>
+
+  <h2>Backend Metrics</h2>
+  <pre id="metrics">Loading metrics...</pre>
+
+  <script>
+    fetch('/api/message', {
+      headers: {
+        'X-Request-Id': 'day38-frontend-message-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-message').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-message').textContent =
+          'Failed to reach Day 38 backend API: ' + error;
+      });
+
+    fetch('/api/config', {
+      headers: {
+        'X-Request-Id': 'day38-frontend-config-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-config').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-config').textContent =
+          'Failed to reach Day 38 backend config API: ' + error;
+      });
+
+    fetch('/api/version', {
+      headers: {
+        'X-Request-Id': 'day38-frontend-version-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-version').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-version').textContent =
+          'Failed to reach Day 38 backend version API: ' + error;
+      });
+
+    fetch('/metrics', {
+      headers: {
+        'X-Request-Id': 'day38-frontend-metrics-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('metrics').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('metrics').textContent =
+          'Failed to reach Day 38 backend metrics: ' + error;
+      });
+  </script>
+</body>
+</html>
