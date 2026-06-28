@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DevOps Day 40</title>
+</head>
+<body>
+  <h1>DevOps Day 40</h1>
+  <p>Frontend starts after the Day 40 backend becomes healthy.</p>
+  <p>Day 40 adds a Jenkins deployment audit report after smoke tests pass.</p>
+
+  <h2>Backend API Message</h2>
+  <pre id="api-message">Loading message...</pre>
+
+  <h2>Backend Runtime Config</h2>
+  <pre id="api-config">Loading config...</pre>
+
+  <h2>Backend Version</h2>
+  <pre id="api-version">Loading version...</pre>
+
+  <h2>Backend Release Manifest</h2>
+  <pre id="api-release">Loading release manifest...</pre>
+
+  <h2>Backend Audit Readiness</h2>
+  <pre id="api-audit-ready">Loading audit readiness...</pre>
+
+  <h2>Backend Metrics</h2>
+  <pre id="metrics">Loading metrics...</pre>
+
+  <script>
+    fetch('/api/message', {
+      headers: {
+        'X-Request-Id': 'day40-frontend-message-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-message').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-message').textContent =
+          'Failed to reach Day 40 backend API: ' + error;
+      });
+
+    fetch('/api/config', {
+      headers: {
+        'X-Request-Id': 'day40-frontend-config-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-config').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-config').textContent =
+          'Failed to reach Day 40 backend config API: ' + error;
+      });
+
+    fetch('/api/version', {
+      headers: {
+        'X-Request-Id': 'day40-frontend-version-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-version').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-version').textContent =
+          'Failed to reach Day 40 backend version API: ' + error;
+      });
+
+    fetch('/api/release', {
+      headers: {
+        'X-Request-Id': 'day40-frontend-release-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-release').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-release').textContent =
+          'Failed to reach Day 40 backend release API: ' + error;
+      });
+
+    fetch('/api/audit-ready', {
+      headers: {
+        'X-Request-Id': 'day40-frontend-audit-ready-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('api-audit-ready').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('api-audit-ready').textContent =
+          'Failed to reach Day 40 backend audit-readiness API: ' + error;
+      });
+
+    fetch('/metrics', {
+      headers: {
+        'X-Request-Id': 'day40-frontend-metrics-request'
+      }
+    })
+      .then(response => response.json())
+      .then(data => {
+        document.getElementById('metrics').textContent =
+          JSON.stringify(data, null, 2);
+      })
+      .catch(error => {
+        document.getElementById('metrics').textContent =
+          'Failed to reach Day 40 backend metrics: ' + error;
+      });
+  </script>
+</body>
+</html>
