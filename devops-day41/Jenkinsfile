@@ -423,7 +423,7 @@ README.md
     -u BUILD_NUMBER \
     -u GIT_COMMIT \
     -u IMAGE_TAG \
-    node app.js > day40-missing-env.log 2>&1
+    node app.js > day41-missing-env.log 2>&1
                     EXIT_CODE=$?
                     set -e
 
