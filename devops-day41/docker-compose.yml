@@ -1,0 +1,48 @@
+services:
+  day41-backend:
+    build:
+      context: ./backend
+      args:
+        DAY41_SERVICE_NAME: "${DAY41_SERVICE_NAME}"
+        DAY41_DEPLOY_TARGET: "${DAY41_DEPLOY_TARGET}"
+        DAY41_APP_VERSION: "${DAY41_APP_VERSION}"
+        DAY41_BUILD_NUMBER: "${DAY41_BUILD_NUMBER}"
+        DAY41_GIT_COMMIT: "${DAY41_GIT_COMMIT}"
+        DAY41_IMAGE_TAG: "${DAY41_IMAGE_TAG}"
+        DAY41_RELEASE_CREATED_AT: "${DAY41_RELEASE_CREATED_AT}"
+    image: day41-backend:${DAY41_IMAGE_TAG}
+    container_name: day41_backend
+    environment:
+      PORT: "${DAY41_BACKEND_PORT}"
+      APP_ENV: "${DAY41_APP_ENV}"
+      DEPLOY_TARGET: "${DAY41_DEPLOY_TARGET}"
+      APP_VERSION: "${DAY41_APP_VERSION}"
+      SERVICE_NAME: "${DAY41_SERVICE_NAME}"
+      FEATURE_FLAG: "${DAY41_FEATURE_FLAG}"
+      LOG_LEVEL: "${DAY41_LOG_LEVEL}"
+      METRICS_ENABLED: "${DAY41_METRICS_ENABLED}"
+      BUILD_NUMBER: "${DAY41_BUILD_NUMBER}"
+      GIT_COMMIT: "${DAY41_GIT_COMMIT}"
+      IMAGE_TAG: "${DAY41_IMAGE_TAG}"
+      RELEASE_CREATED_AT: "${DAY41_RELEASE_CREATED_AT}"
+    ports:
+      - "${DAY41_BACKEND_PORT}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+
+  day41-frontend:
+    build:
+      context: ./frontend
+    image: day41-frontend:${DAY41_IMAGE_TAG}
+    container_name: day41_frontend
+    ports:
+      - "${DAY41_FRONTEND_PORT}:80"
+    depends_on:
+      day41-backend:
+        condition: service_healthy
+    restart: unless-stopped
