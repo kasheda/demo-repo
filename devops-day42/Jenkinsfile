@@ -1,0 +1,928 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'dev', 'prodlike'],
+            description: 'Choose which Day 42 environment Jenkins should deploy.'
+        )
+
+        choice(
+            name: 'SIMULATE_ROLLBACK',
+            choices: ['false', 'true'],
+            description: 'When true, Jenkins simulates candidate failure and rolls back to the previous known-good tag.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 42'
+        PROJECT_DIR = 'devops-day42'
+        RUNTIME_ENV_FILE = '.env.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day42_backend'
+        FRONTEND_CONTAINER = 'day42_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        AUDIT_JSON = 'deployment-audit/day42-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day42-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day42-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day42-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 42...'
+                checkout scm
+            }
+        }
+
+        stage('Select Day 42 Environment File') {
+            steps {
+                script {
+                    if (params.DEPLOY_ENV == 'dev') {
+                        env.BASE_ENV_FILE = '.env'
+                        env.EXPECTED_APP_ENV = 'day42-dev-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'dev'
+                        env.EXPECTED_APP_VERSION = 'day42-dev-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8042'
+                    } else if (params.DEPLOY_ENV == 'staging') {
+                        env.BASE_ENV_FILE = '.env.staging'
+                        env.EXPECTED_APP_ENV = 'day42-staging-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'staging'
+                        env.EXPECTED_APP_VERSION = 'day42-staging-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8142'
+                    } else if (params.DEPLOY_ENV == 'prodlike') {
+                        env.BASE_ENV_FILE = '.env.prodlike'
+                        env.EXPECTED_APP_ENV = 'day42-prodlike-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'prodlike'
+                        env.EXPECTED_APP_VERSION = 'day42-prodlike-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'disabled'
+                        env.EXPECTED_FRONTEND_PORT = '8242'
+                    } else {
+                        error "Unsupported Day 42 DEPLOY_ENV: ${params.DEPLOY_ENV}"
+                    }
+
+                    echo "Day 42 selected DEPLOY_ENV=${params.DEPLOY_ENV}"
+                    echo "Day 42 selected BASE_ENV_FILE=${env.BASE_ENV_FILE}"
+                    echo "Day 42 SIMULATE_ROLLBACK=${params.SIMULATE_ROLLBACK}"
+                }
+            }
+        }
+
+        stage('Validate Day 42 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Validating Day 42 Jenkins runtime tools..."
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 42 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 42 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 42 required project files..."
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 42 file: $file"
+                        echo "Current Day 42 files:"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 42 file: $file"
+                    done
+
+                    echo "All Day 42 required files found."
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 42 Runtime Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Generating Day 42 runtime env file from $BASE_ENV_FILE..."
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+
+                    CANDIDATE_IMAGE_TAG="day42-${DEPLOY_ENV}-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day42-${DEPLOY_ENV}-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    grep -v '^DAY42_BUILD_NUMBER=' "$BASE_ENV_FILE" \
+                      | grep -v '^DAY42_GIT_COMMIT=' \
+                      | grep -v '^DAY42_IMAGE_TAG=' \
+                      | grep -v '^DAY42_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY42_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY42_ROLLBACK_MODE=' > "$RUNTIME_ENV_FILE"
+
+                    {
+                      echo "DAY42_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY42_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY42_IMAGE_TAG=$CANDIDATE_IMAGE_TAG"
+                      echo "DAY42_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY42_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY42_ROLLBACK_MODE=normal"
+                    } >> "$RUNTIME_ENV_FILE"
+
+                    grep -v '^DAY42_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY42_GIT_COMMIT=' \
+                      | grep -v '^DAY42_IMAGE_TAG=' \
+                      | grep -v '^DAY42_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY42_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY42_ROLLBACK_MODE=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY42_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY42_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY42_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY42_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY42_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY42_ROLLBACK_MODE=rollback"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "Day 42 candidate runtime env file:"
+                    cat "$RUNTIME_ENV_FILE"
+
+                    echo "Day 42 rollback runtime env file:"
+                    cat "$ROLLBACK_ENV_FILE"
+
+                    echo "DAY42_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day42-build-metadata.env
+                    echo "DAY42_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day42-build-metadata.env
+                    echo "DAY42_EXPECTED_IMAGE_TAG=$CANDIDATE_IMAGE_TAG" >> day42-build-metadata.env
+                    echo "DAY42_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day42-build-metadata.env
+                    echo "DAY42_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day42-build-metadata.env
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 42 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day42-build-metadata.env && echo \$DAY42_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day42-build-metadata.env && echo \$DAY42_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_IMAGE_TAG = sh(returnStdout: true, script: ". ./day42-build-metadata.env && echo \$DAY42_EXPECTED_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day42-build-metadata.env && echo \$DAY42_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day42-build-metadata.env && echo \$DAY42_EXPECTED_RELEASE_CREATED_AT").trim()
+
+                        echo "Day 42 expected candidate image tag: ${env.EXPECTED_IMAGE_TAG}"
+                        echo "Day 42 expected rollback image tag: ${env.EXPECTED_ROLLBACK_IMAGE_TAG}"
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 42 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    echo "Validating Day 42 backend JavaScript syntax..."
+                    node --check app.js
+                    echo "Day 42 backend syntax is valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 Frontend Files') {
+            steps {
+                dir("${PROJECT_DIR}/frontend") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 42 frontend files..."
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    grep "DevOps Day 42" index.html
+                    grep "day42-backend" nginx.conf
+                    grep "X-Request-Id" nginx.conf
+                    grep "/metrics" nginx.conf
+                    grep "/api/rollback-ready" index.html
+
+                    if grep -q '\\${DAY42' nginx.conf; then
+                      echo "Day 42 nginx.conf should not contain unresolved env placeholders."
+                      exit 1
+                    fi
+
+                    echo "Day 42 frontend files are valid."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 42 env files..."
+
+                    grep "DAY42_APP_ENV=day42-dev-env" .env
+                    grep "DAY42_DEPLOY_TARGET=dev" .env
+                    grep "DAY42_FRONTEND_PORT=8042" .env
+
+                    grep "DAY42_APP_ENV=day42-staging-env" .env.staging
+                    grep "DAY42_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY42_FRONTEND_PORT=8142" .env.staging
+
+                    grep "DAY42_APP_ENV=day42-prodlike-env" .env.prodlike
+                    grep "DAY42_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY42_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY42_FRONTEND_PORT=8242" .env.prodlike
+
+                    grep "DAY42_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY42_IMAGE_TAG=day42-rollback-placeholder" .env.rollback
+
+                    echo "Day 42 env file validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Checking Day 42 env key drift..."
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day42-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day42-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day42-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day42-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day42-env-example-keys.txt
+
+                    diff -u day42-env-example-keys.txt day42-env-keys.txt
+                    diff -u day42-env-example-keys.txt day42-staging-env-keys.txt
+                    diff -u day42-env-example-keys.txt day42-prodlike-env-keys.txt
+                    diff -u day42-env-example-keys.txt day42-rollback-env-keys.txt
+
+                    rm -f day42-env-keys.txt day42-staging-env-keys.txt day42-prodlike-env-keys.txt day42-rollback-env-keys.txt day42-env-example-keys.txt
+
+                    echo "Day 42 env files contain the same keys."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 Rollback Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 42 rollback code..."
+
+                    grep "ROLLBACK_IMAGE_TAG" backend/app.js
+                    grep "ROLLBACK_MODE" backend/app.js
+                    grep "app.get('/api/rollback-ready'" backend/app.js
+                    grep "rollbackReady" backend/app.js
+                    grep "SIMULATE_ROLLBACK" Jenkinsfile
+                    grep "ROLLBACK_ENV_FILE" Jenkinsfile
+                    grep "rollback" .env.rollback
+
+                    echo "Day 42 rollback code validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 Release Manifest Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 42 release manifest code..."
+
+                    grep "release.json" backend/Dockerfile
+                    grep "DAY42_ROLLBACK_IMAGE_TAG" backend/Dockerfile
+                    grep "DAY42_ROLLBACK_MODE" backend/Dockerfile
+                    grep "releaseManifestMatchesRuntime" backend/app.js
+                    grep "app.get('/api/release'" backend/app.js
+
+                    echo "Day 42 release manifest code validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Validating Day 42 Docker Compose config..."
+
+                    grep "condition: service_healthy" docker-compose.yml
+                    grep "healthcheck:" docker-compose.yml
+                    grep "day42-backend:" docker-compose.yml
+                    grep "day42-backend:\\${DAY42_IMAGE_TAG}" docker-compose.yml
+                    grep "DAY42_ROLLBACK_IMAGE_TAG" docker-compose.yml
+                    grep "DAY42_ROLLBACK_MODE" docker-compose.yml
+                    grep "http://127.0.0.1:3000/health" docker-compose.yml
+
+                    if grep -q "broken-health" docker-compose.yml; then
+                      echo "Day 42 docker-compose.yml contains broken-health."
+                      exit 1
+                    fi
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "$EXPECTED_IMAGE_TAG"
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" config | grep "$EXPECTED_ROLLBACK_IMAGE_TAG"
+
+                    echo "Day 42 Compose validation passed."
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 42 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    echo "Testing that Day 42 backend fails fast without required environment variables..."
+
+                    set +e
+                    env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day42-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day42-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 42 backend unexpectedly started without required environment variables."
+                      rm -f day42-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day42-missing-env.log
+                    grep "ROLLBACK_IMAGE_TAG" day42-missing-env.log
+                    grep "ROLLBACK_MODE" day42-missing-env.log
+
+                    rm -f day42-missing-env.log
+
+                    echo "Day 42 backend correctly fails when required environment variables are missing."
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 42 Candidate and Rollback Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Building Day 42 candidate image: $EXPECTED_IMAGE_TAG"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" build --no-cache
+
+                    echo "Building Day 42 rollback image: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker images | grep "day42-backend" || true
+
+                    echo "Verifying candidate image manifest..."
+                    docker run --rm "day42-backend:$EXPECTED_IMAGE_TAG" cat /app/release.json | tee day42-candidate-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_IMAGE_TAG\\"" day42-candidate-release.json
+                    grep "\\"rollbackMode\\": \\"normal\\"" day42-candidate-release.json
+
+                    echo "Verifying rollback image manifest..."
+                    docker run --rm "day42-backend:$EXPECTED_ROLLBACK_IMAGE_TAG" cat /app/release.json | tee day42-rollback-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_ROLLBACK_IMAGE_TAG\\"" day42-rollback-release.json
+                    grep "\\"rollbackMode\\": \\"rollback\\"" day42-rollback-release.json
+
+                    rm -f day42-candidate-release.json day42-rollback-release.json
+
+                    echo "Day 42 candidate and rollback images built successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 42 Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Stopping old Day 42 containers if they exist..."
+                    docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+
+                    echo "Deploying Day 42 candidate image..."
+                    docker compose --env-file "$RUNTIME_ENV_FILE" up -d
+
+                    docker ps --filter "name=day42_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 42 Candidate Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 42 candidate backend health: $BACKEND_HEALTH"
+                    echo "Day 42 candidate frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "Day 42 candidate is healthy."
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test Day 42 Candidate') {
+            steps {
+                sh '''
+                set -e
+
+                HEALTH_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-health-smoke' http://127.0.0.1:3000/health")
+                ROLLBACK_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-rollback-ready-smoke' http://127.0.0.1:3000/api/rollback-ready")
+                RELEASE_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-release-smoke' http://127.0.0.1:3000/api/release")
+
+                echo "$HEALTH_RESPONSE"
+                echo "$ROLLBACK_RESPONSE"
+                echo "$RELEASE_RESPONSE"
+
+                echo "$HEALTH_RESPONSE" | grep '"status":"ok"'
+                echo "$HEALTH_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                echo "$HEALTH_RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$HEALTH_RESPONSE" | grep '"rollbackMode":"normal"'
+
+                echo "$ROLLBACK_RESPONSE" | grep '"rollbackReady":true'
+                echo "$ROLLBACK_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$ROLLBACK_RESPONSE" | grep "\\"rollbackImageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                echo "$ROLLBACK_RESPONSE" | grep '"rollbackMode":"normal"'
+
+                echo "$RELEASE_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                echo "Day 42 candidate smoke tests passed."
+                '''
+            }
+        }
+
+        stage('Optional Day 42 Rollback Simulation') {
+            when {
+                expression {
+                    return params.SIMULATE_ROLLBACK == 'true'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "SIMULATE_ROLLBACK=true"
+                    echo "Simulating candidate validation failure after candidate passed basic smoke tests."
+                    echo "Rolling back to known rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" up -d
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Rollback backend health: $BACKEND_HEALTH"
+                    echo "Rollback frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "Rollback deployment is healthy."
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 42 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                FINAL_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-final-rollback-ready' http://127.0.0.1:3000/api/rollback-ready")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "$FINAL_RESPONSE"
+                echo "Final backend image: $FINAL_IMAGE"
+
+                if [ "$SIMULATE_ROLLBACK" = "true" ]; then
+                  echo "$FINAL_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                  echo "$FINAL_RESPONSE" | grep '"rollbackMode":"rollback"'
+                  echo "$FINAL_IMAGE" | grep "day42-backend:$EXPECTED_ROLLBACK_IMAGE_TAG"
+                else
+                  echo "$FINAL_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                  echo "$FINAL_RESPONSE" | grep '"rollbackMode":"normal"'
+                  echo "$FINAL_IMAGE" | grep "day42-backend:$EXPECTED_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                echo "Day 42 final deployment state verified."
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 42 API Config Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-api-smoke' http://127.0.0.1:3000/api/message")
+                CONFIG_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-config-smoke' http://127.0.0.1:3000/api/config")
+                METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-metrics-smoke' http://127.0.0.1:3000/metrics")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$CONFIG_RESPONSE"
+                echo "$METRICS_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 42 backend API'
+                echo "$CONFIG_RESPONSE" | grep '"service":"day42-backend"'
+                echo "$CONFIG_RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                echo "$METRICS_RESPONSE" | grep '"/api/rollback-ready"'
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 42'
+                echo "$PAGE_RESPONSE" | grep 'Rollback Readiness'
+
+                echo "Day 42 API, config, metrics, and frontend smoke tests passed."
+                '''
+            }
+        }
+
+        stage('Verify Day 42 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day42-api-smoke'
+                echo "$LOGS" | grep 'day42-config-smoke'
+                echo "$LOGS" | grep 'day42-final-rollback-ready'
+                echo "$LOGS" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+
+                if [ "$SIMULATE_ROLLBACK" = "true" ]; then
+                  echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                  echo "$LOGS" | grep "\\"rollbackMode\\":\\"rollback\\""
+                else
+                  echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                  echo "$LOGS" | grep "\\"rollbackMode\\":\\"normal\\""
+                fi
+
+                echo "Day 42 backend logs contain rollback-aware evidence."
+                '''
+            }
+        }
+
+        stage('Write Day 42 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    FINAL_ROLLBACK_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day42-audit-rollback-ready' http://127.0.0.1:3000/api/rollback-ready")
+
+                    if [ "$SIMULATE_ROLLBACK" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_ROLLBACK_IMAGE_TAG"
+                      FINAL_ROLLBACK_MODE="rollback"
+                      ROLLBACK_PERFORMED="true"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_IMAGE_TAG"
+                      FINAL_ROLLBACK_MODE="normal"
+                      ROLLBACK_PERFORMED="false"
+                    fi
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 42",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "deployEnvParameter": "$DEPLOY_ENV",
+  "simulateRollback": "$SIMULATE_ROLLBACK",
+  "rollbackPerformed": $ROLLBACK_PERFORMED,
+  "baseEnvFile": "$BASE_ENV_FILE",
+  "runtimeEnvFile": "$RUNTIME_ENV_FILE",
+  "rollbackEnvFile": "$ROLLBACK_ENV_FILE",
+  "expected": {
+    "candidateImageTag": "$EXPECTED_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalRollbackMode": "$FINAL_ROLLBACK_MODE",
+    "appEnvironment": "$EXPECTED_APP_ENV",
+    "deployTarget": "$EXPECTED_DEPLOY_TARGET",
+    "appVersion": "$EXPECTED_APP_VERSION",
+    "featureFlag": "$EXPECTED_FEATURE_FLAG",
+    "gitCommit": "$EXPECTED_GIT_COMMIT",
+    "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT"
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "candidateBuilt": true,
+    "rollbackImageBuilt": true,
+    "candidateSmokePassed": true,
+    "rollbackPerformed": $ROLLBACK_PERFORMED,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "rollbackReadyEndpointPassed": true,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 42 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+Deploy environment parameter: $DEPLOY_ENV
+Simulate rollback: $SIMULATE_ROLLBACK
+Rollback performed: $ROLLBACK_PERFORMED
+
+Candidate image tag: $EXPECTED_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final rollback mode: $FINAL_ROLLBACK_MODE
+
+Expected app environment: $EXPECTED_APP_ENV
+Expected deploy target: $EXPECTED_DEPLOY_TARGET
+Expected app version: $EXPECTED_APP_VERSION
+Expected feature flag: $EXPECTED_FEATURE_FLAG
+Expected git commit: $EXPECTED_GIT_COMMIT
+Expected release created at: $EXPECTED_RELEASE_CREATED_AT
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Final rollback readiness response:
+$FINAL_ROLLBACK_RESPONSE
+EOF
+
+                    grep "\\"day\\": \\"Day 42\\"" "$AUDIT_JSON"
+                    grep "\\"candidateImageTag\\": \\"$EXPECTED_IMAGE_TAG\\"" "$AUDIT_JSON"
+                    grep "\\"rollbackImageTag\\": \\"$EXPECTED_ROLLBACK_IMAGE_TAG\\"" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+                    grep "\\"releaseManifestMatchesRuntime\\": true" "$AUDIT_JSON"
+
+                    grep "Day 42 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "$EXPECTED_IMAGE_TAG" "$AUDIT_TEXT"
+                    grep "$EXPECTED_ROLLBACK_IMAGE_TAG" "$AUDIT_TEXT"
+
+                    echo "Day 42 deployment audit report written and validated."
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 42 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Packaging Day 42 deployment evidence..."
+
+                    test -f "$AUDIT_JSON"
+                    test -f "$AUDIT_TEXT"
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day42-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day42-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day42-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 42 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Created from Jenkins build: $EXPECTED_BUILD_NUMBER"
+                      echo "Deploy env: $DEPLOY_ENV"
+                      echo "Simulate rollback: $SIMULATE_ROLLBACK"
+                      echo "Candidate image tag: $EXPECTED_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo "Release created at: $EXPECTED_RELEASE_CREATED_AT"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day42-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day42-running-release.json" \
+                      "$AUDIT_DIR/day42-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day42-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day42-evidence-summary.txt" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day42-running-release.json" \
+                      "$AUDIT_DIR/day42-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day42-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day42-evidence-summary.txt"
+
+                    tar -tzf "$EVIDENCE_BUNDLE"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day42-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day42-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day42-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day42-running-release.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day42-evidence-summary.txt"
+
+                    sha256sum -c "$CHECKSUM_FILE"
+
+                    echo "Day 42 evidence bundle created and checksums verified."
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 42 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day42-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 42 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 42 selected DEPLOY_ENV: $DEPLOY_ENV"
+                    echo "Day 42 SIMULATE_ROLLBACK: $SIMULATE_ROLLBACK"
+                    echo "Day 42 candidate tag: $EXPECTED_IMAGE_TAG"
+                    echo "Day 42 rollback tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+
+                    echo "Day 42 audit files:"
+                    ls -la "$AUDIT_DIR"
+
+                    echo "Day 42 Docker Compose service status:"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" ps || true
+
+                    echo "Day 42 containers:"
+                    docker ps -a --filter "name=day42_"
+
+                    echo "Day 42 backend image:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                    echo "Day 42 backend release manifest:"
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                    echo "Recent Day 42 backend logs:"
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 42 pipeline completed successfully. Rollback simulation and evidence packaging passed.'
+        }
+
+        failure {
+            echo 'Day 42 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 42 selected DEPLOY_ENV:"
+                echo "$DEPLOY_ENV"
+
+                echo "Final Day 42 SIMULATE_ROLLBACK:"
+                echo "$SIMULATE_ROLLBACK"
+
+                echo "Final Day 42 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 42 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 42 container list:"
+                docker ps -a --filter "name=day42_" || true
+
+                echo "Final Day 42 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 42 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 42 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 42 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
