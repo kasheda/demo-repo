@@ -1,0 +1,868 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'dev', 'prodlike'],
+            description: 'Choose which Day 43 environment Jenkins should deploy.'
+        )
+
+        choice(
+            name: 'SIMULATE_ROLLBACK',
+            choices: ['false', 'true'],
+            description: 'When true, Jenkins simulates candidate failure and rolls back.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 43'
+        PROJECT_DIR = 'devops-day43'
+        RUNTIME_ENV_FILE = '.env.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day43_backend'
+        FRONTEND_CONTAINER = 'day43_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        AUDIT_JSON = 'deployment-audit/day43-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day43-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day43-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day43-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 43...'
+                checkout scm
+            }
+        }
+
+        stage('Select Day 43 Environment File') {
+            steps {
+                script {
+                    if (params.DEPLOY_ENV == 'dev') {
+                        env.BASE_ENV_FILE = '.env'
+                        env.EXPECTED_APP_ENV = 'day43-dev-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'dev'
+                        env.EXPECTED_APP_VERSION = 'day43-dev-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8043'
+                    } else if (params.DEPLOY_ENV == 'staging') {
+                        env.BASE_ENV_FILE = '.env.staging'
+                        env.EXPECTED_APP_ENV = 'day43-staging-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'staging'
+                        env.EXPECTED_APP_VERSION = 'day43-staging-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8143'
+                    } else if (params.DEPLOY_ENV == 'prodlike') {
+                        env.BASE_ENV_FILE = '.env.prodlike'
+                        env.EXPECTED_APP_ENV = 'day43-prodlike-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'prodlike'
+                        env.EXPECTED_APP_VERSION = 'day43-prodlike-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'disabled'
+                        env.EXPECTED_FRONTEND_PORT = '8243'
+                    } else {
+                        error "Unsupported Day 43 DEPLOY_ENV: ${params.DEPLOY_ENV}"
+                    }
+
+                    echo "Day 43 selected DEPLOY_ENV=${params.DEPLOY_ENV}"
+                    echo "Day 43 selected BASE_ENV_FILE=${env.BASE_ENV_FILE}"
+                    echo "Day 43 SIMULATE_ROLLBACK=${params.SIMULATE_ROLLBACK}"
+                }
+            }
+        }
+
+        stage('Validate Day 43 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Validating Day 43 Jenkins runtime tools..."
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 43 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 43 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 43 file: $file"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+                      echo "Found Day 43 file: $file"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 43 Runtime Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+
+                    CANDIDATE_IMAGE_TAG="day43-${DEPLOY_ENV}-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day43-${DEPLOY_ENV}-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    grep -v '^DAY43_BUILD_NUMBER=' "$BASE_ENV_FILE" \
+                      | grep -v '^DAY43_GIT_COMMIT=' \
+                      | grep -v '^DAY43_IMAGE_TAG=' \
+                      | grep -v '^DAY43_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY43_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY43_ROLLBACK_MODE=' > "$RUNTIME_ENV_FILE"
+
+                    {
+                      echo "DAY43_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY43_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY43_IMAGE_TAG=$CANDIDATE_IMAGE_TAG"
+                      echo "DAY43_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY43_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY43_ROLLBACK_MODE=normal"
+                    } >> "$RUNTIME_ENV_FILE"
+
+                    grep -v '^DAY43_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY43_GIT_COMMIT=' \
+                      | grep -v '^DAY43_IMAGE_TAG=' \
+                      | grep -v '^DAY43_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY43_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY43_ROLLBACK_MODE=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY43_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY43_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY43_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY43_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY43_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY43_ROLLBACK_MODE=rollback"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "Day 43 candidate runtime env file:"
+                    cat "$RUNTIME_ENV_FILE"
+
+                    echo "Day 43 rollback runtime env file:"
+                    cat "$ROLLBACK_ENV_FILE"
+
+                    echo "DAY43_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day43-build-metadata.env
+                    echo "DAY43_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day43-build-metadata.env
+                    echo "DAY43_EXPECTED_IMAGE_TAG=$CANDIDATE_IMAGE_TAG" >> day43-build-metadata.env
+                    echo "DAY43_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day43-build-metadata.env
+                    echo "DAY43_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day43-build-metadata.env
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 43 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day43-build-metadata.env && echo \$DAY43_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day43-build-metadata.env && echo \$DAY43_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_IMAGE_TAG = sh(returnStdout: true, script: ". ./day43-build-metadata.env && echo \$DAY43_EXPECTED_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day43-build-metadata.env && echo \$DAY43_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day43-build-metadata.env && echo \$DAY43_EXPECTED_RELEASE_CREATED_AT").trim()
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 43 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    node --check app.js
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 43 Frontend Files') {
+            steps {
+                dir("${PROJECT_DIR}/frontend") {
+                    sh '''
+                    set -e
+
+                    test -s index.html
+                    test -s nginx.conf
+
+                    grep "DevOps Day 43" index.html
+                    grep "day43-backend" nginx.conf
+                    grep "/api/stability" index.html
+                    grep "Backend Stability" index.html
+
+                    if grep -q '\\${DAY43' nginx.conf; then
+                      echo "Day 43 nginx.conf should not contain unresolved env placeholders."
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 43 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DAY43_APP_ENV=day43-dev-env" .env
+                    grep "DAY43_DEPLOY_TARGET=dev" .env
+                    grep "DAY43_FRONTEND_PORT=8043" .env
+                    grep "DAY43_STABILITY_CHECK_WINDOW_SECONDS=15" .env
+                    grep "DAY43_STABILITY_CHECK_INTERVAL_SECONDS=5" .env
+
+                    grep "DAY43_APP_ENV=day43-staging-env" .env.staging
+                    grep "DAY43_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY43_FRONTEND_PORT=8143" .env.staging
+
+                    grep "DAY43_APP_ENV=day43-prodlike-env" .env.prodlike
+                    grep "DAY43_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY43_FEATURE_FLAG=disabled" .env.prodlike
+
+                    grep "DAY43_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY43_STABILITY_CHECK_WINDOW_SECONDS=15" .env.rollback
+                    grep "DAY43_STABILITY_CHECK_INTERVAL_SECONDS=5" .env.rollback
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 43 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day43-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day43-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day43-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day43-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day43-env-example-keys.txt
+
+                    diff -u day43-env-example-keys.txt day43-env-keys.txt
+                    diff -u day43-env-example-keys.txt day43-staging-env-keys.txt
+                    diff -u day43-env-example-keys.txt day43-prodlike-env-keys.txt
+                    diff -u day43-env-example-keys.txt day43-rollback-env-keys.txt
+
+                    rm -f day43-env-keys.txt day43-staging-env-keys.txt day43-prodlike-env-keys.txt day43-rollback-env-keys.txt day43-env-example-keys.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 43 Stability Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "STABILITY_CHECK_WINDOW_SECONDS" backend/app.js
+                    grep "STABILITY_CHECK_INTERVAL_SECONDS" backend/app.js
+                    grep "app.get('/api/stability'" backend/app.js
+                    grep "stable" backend/app.js
+                    grep "Post-Deployment Monitoring Gate" README.md
+                    grep "DAY43_STABILITY_CHECK_WINDOW_SECONDS" docker-compose.yml
+                    grep "DAY43_STABILITY_CHECK_INTERVAL_SECONDS" docker-compose.yml
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 43 Compose Config') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "condition: service_healthy" docker-compose.yml
+                    grep "day43-backend:\\${DAY43_IMAGE_TAG}" docker-compose.yml
+                    grep "DAY43_STABILITY_CHECK_WINDOW_SECONDS" docker-compose.yml
+                    grep "DAY43_STABILITY_CHECK_INTERVAL_SECONDS" docker-compose.yml
+                    grep "http://127.0.0.1:3000/health" docker-compose.yml
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "$EXPECTED_IMAGE_TAG"
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" config | grep "$EXPECTED_ROLLBACK_IMAGE_TAG"
+                    docker compose --env-file "$RUNTIME_ENV_FILE" config | grep "STABILITY_CHECK_WINDOW_SECONDS"
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 43 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    set +e
+                    env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day43-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day43-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 43 backend unexpectedly started without required environment variables."
+                      rm -f day43-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day43-missing-env.log
+                    grep "STABILITY_CHECK_WINDOW_SECONDS" day43-missing-env.log
+                    grep "STABILITY_CHECK_INTERVAL_SECONDS" day43-missing-env.log
+
+                    rm -f day43-missing-env.log
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 43 Candidate and Rollback Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" build --no-cache
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker run --rm "day43-backend:$EXPECTED_IMAGE_TAG" cat /app/release.json | tee day43-candidate-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_IMAGE_TAG\\"" day43-candidate-release.json
+                    grep "\\"rollbackMode\\": \\"normal\\"" day43-candidate-release.json
+                    grep "\\"stabilityCheckWindowSeconds\\": \\"15\\"" day43-candidate-release.json
+
+                    docker run --rm "day43-backend:$EXPECTED_ROLLBACK_IMAGE_TAG" cat /app/release.json | tee day43-rollback-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_ROLLBACK_IMAGE_TAG\\"" day43-rollback-release.json
+                    grep "\\"rollbackMode\\": \\"rollback\\"" day43-rollback-release.json
+
+                    rm -f day43-candidate-release.json day43-rollback-release.json
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 43 Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+                    docker compose --env-file "$RUNTIME_ENV_FILE" up -d
+
+                    docker ps --filter "name=day43_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 43 Candidate Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 43 candidate backend health: $BACKEND_HEALTH"
+                    echo "Day 43 candidate frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test Day 43 Candidate') {
+            steps {
+                sh '''
+                set -e
+
+                HEALTH_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-health-smoke' http://127.0.0.1:3000/health")
+                ROLLBACK_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-rollback-ready-smoke' http://127.0.0.1:3000/api/rollback-ready")
+                STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-stability-smoke' http://127.0.0.1:3000/api/stability")
+
+                echo "$HEALTH_RESPONSE"
+                echo "$ROLLBACK_RESPONSE"
+                echo "$STABILITY_RESPONSE"
+
+                echo "$HEALTH_RESPONSE" | grep '"status":"ok"'
+                echo "$HEALTH_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                echo "$HEALTH_RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+
+                echo "$ROLLBACK_RESPONSE" | grep '"rollbackReady":true'
+                echo "$ROLLBACK_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$ROLLBACK_RESPONSE" | grep "\\"rollbackImageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+
+                echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                echo "$STABILITY_RESPONSE" | grep '"stabilityCheckWindowSeconds":15'
+                echo "$STABILITY_RESPONSE" | grep '"stabilityCheckIntervalSeconds":5'
+                '''
+            }
+        }
+
+        stage('Optional Day 43 Rollback Simulation') {
+            when {
+                expression {
+                    return params.SIMULATE_ROLLBACK == 'true'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "SIMULATE_ROLLBACK=true. Rolling back to: $EXPECTED_ROLLBACK_IMAGE_TAG"
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" up -d
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 43 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                FINAL_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-final-rollback-ready' http://127.0.0.1:3000/api/rollback-ready")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "$FINAL_RESPONSE"
+                echo "$FINAL_IMAGE"
+
+                if [ "$SIMULATE_ROLLBACK" = "true" ]; then
+                  echo "$FINAL_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                  echo "$FINAL_RESPONSE" | grep '"rollbackMode":"rollback"'
+                  echo "$FINAL_IMAGE" | grep "day43-backend:$EXPECTED_ROLLBACK_IMAGE_TAG"
+                else
+                  echo "$FINAL_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                  echo "$FINAL_RESPONSE" | grep '"rollbackMode":"normal"'
+                  echo "$FINAL_IMAGE" | grep "day43-backend:$EXPECTED_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                '''
+            }
+        }
+
+        stage('Day 43 Post-Deployment Monitoring Gate') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Starting Day 43 post-deployment monitoring gate..."
+
+                STABILITY_LOG="day43-stability-checks.log"
+                rm -f "$STABILITY_LOG"
+
+                CHECK_NUMBER=1
+                TOTAL_CHECKS=3
+
+                while [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; do
+                  echo "Day 43 stability check $CHECK_NUMBER of $TOTAL_CHECKS"
+
+                  STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-stability-gate-$CHECK_NUMBER' http://127.0.0.1:3000/api/stability")
+                  HEALTH_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-health-gate-$CHECK_NUMBER' http://127.0.0.1:3000/health")
+                  METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-metrics-gate-$CHECK_NUMBER' http://127.0.0.1:3000/metrics")
+
+                  {
+                    echo "===== stability check $CHECK_NUMBER ====="
+                    echo "$STABILITY_RESPONSE"
+                    echo "$HEALTH_RESPONSE"
+                    echo "$METRICS_RESPONSE"
+                  } >> "$STABILITY_LOG"
+
+                  echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                  echo "$STABILITY_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                  echo "$STABILITY_RESPONSE" | grep '"errorCount"'
+
+                  echo "$HEALTH_RESPONSE" | grep '"status":"ok"'
+                  echo "$HEALTH_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                  echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                  echo "$METRICS_RESPONSE" | grep '"totalRequests"'
+
+                  CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+                  if [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; then
+                    sleep 5
+                  fi
+                done
+
+                echo "Day 43 post-deployment monitoring gate passed."
+                cat "$STABILITY_LOG"
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 43 API Config Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-api-smoke' http://127.0.0.1:3000/api/message")
+                CONFIG_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-config-smoke' http://127.0.0.1:3000/api/config")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$CONFIG_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 43 backend API'
+                echo "$CONFIG_RESPONSE" | grep '"service":"day43-backend"'
+                echo "$CONFIG_RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 43'
+                echo "$PAGE_RESPONSE" | grep 'post-deployment monitoring gate'
+                '''
+            }
+        }
+
+        stage('Verify Day 43 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day43-stability-gate-1'
+                echo "$LOGS" | grep 'day43-stability-gate-2'
+                echo "$LOGS" | grep 'day43-stability-gate-3'
+                echo "$LOGS" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+
+                if [ "$SIMULATE_ROLLBACK" = "true" ]; then
+                  echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                  echo "$LOGS" | grep "\\"rollbackMode\\":\\"rollback\\""
+                else
+                  echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                  echo "$LOGS" | grep "\\"rollbackMode\\":\\"normal\\""
+                fi
+                '''
+            }
+        }
+
+        stage('Write Day 43 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    FINAL_STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day43-audit-stability' http://127.0.0.1:3000/api/stability")
+
+                    if [ "$SIMULATE_ROLLBACK" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_ROLLBACK_IMAGE_TAG"
+                      FINAL_ROLLBACK_MODE="rollback"
+                      ROLLBACK_PERFORMED="true"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_IMAGE_TAG"
+                      FINAL_ROLLBACK_MODE="normal"
+                      ROLLBACK_PERFORMED="false"
+                    fi
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 43",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "deployEnvParameter": "$DEPLOY_ENV",
+  "simulateRollback": "$SIMULATE_ROLLBACK",
+  "rollbackPerformed": $ROLLBACK_PERFORMED,
+  "expected": {
+    "candidateImageTag": "$EXPECTED_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalRollbackMode": "$FINAL_ROLLBACK_MODE",
+    "appEnvironment": "$EXPECTED_APP_ENV",
+    "deployTarget": "$EXPECTED_DEPLOY_TARGET",
+    "appVersion": "$EXPECTED_APP_VERSION",
+    "featureFlag": "$EXPECTED_FEATURE_FLAG",
+    "gitCommit": "$EXPECTED_GIT_COMMIT",
+    "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT",
+    "stabilityChecksExpected": 3
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "candidateBuilt": true,
+    "rollbackImageBuilt": true,
+    "candidateSmokePassed": true,
+    "rollbackPerformed": $ROLLBACK_PERFORMED,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "rollbackReadyEndpointPassed": true,
+    "postDeploymentMonitoringPassed": true,
+    "stabilityChecksPassed": 3,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 43 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+Deploy environment parameter: $DEPLOY_ENV
+Simulate rollback: $SIMULATE_ROLLBACK
+Rollback performed: $ROLLBACK_PERFORMED
+
+Candidate image tag: $EXPECTED_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final rollback mode: $FINAL_ROLLBACK_MODE
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Post-deployment monitoring:
+- Stability checks expected: 3
+- Stability checks passed: 3
+- Monitoring gate: passed
+
+Final stability response:
+$FINAL_STABILITY_RESPONSE
+EOF
+
+                    cp ../day43-stability-checks.log "$AUDIT_DIR/day43-stability-checks.log" 2>/dev/null || true
+
+                    grep "\\"day\\": \\"Day 43\\"" "$AUDIT_JSON"
+                    grep "\\"postDeploymentMonitoringPassed\\": true" "$AUDIT_JSON"
+                    grep "\\"stabilityChecksPassed\\": 3" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+
+                    grep "Day 43 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "Monitoring gate: passed" "$AUDIT_TEXT"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 43 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day43-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day43-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day43-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 43 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Deploy env: $DEPLOY_ENV"
+                      echo "Simulate rollback: $SIMULATE_ROLLBACK"
+                      echo "Candidate image tag: $EXPECTED_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo "Post-deployment monitoring gate: passed"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day43-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day43-running-release.json" \
+                      "$AUDIT_DIR/day43-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day43-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day43-evidence-summary.txt" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day43-running-release.json" \
+                      "$AUDIT_DIR/day43-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day43-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day43-evidence-summary.txt"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day43-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day43-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day43-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day43-running-release.json"
+                    sha256sum -c "$CHECKSUM_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 43 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day43-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 43 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 43 selected DEPLOY_ENV: $DEPLOY_ENV"
+                    echo "Day 43 SIMULATE_ROLLBACK: $SIMULATE_ROLLBACK"
+                    echo "Day 43 candidate tag: $EXPECTED_IMAGE_TAG"
+                    echo "Day 43 rollback tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+
+                    echo "Day 43 audit files:"
+                    ls -la "$AUDIT_DIR"
+
+                    echo "Day 43 evidence bundle listing:"
+                    tar -tzf "$EVIDENCE_BUNDLE"
+
+                    echo "Day 43 containers:"
+                    docker ps -a --filter "name=day43_"
+
+                    echo "Day 43 backend image:"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                    echo "Day 43 backend release manifest:"
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                    echo "Recent Day 43 backend logs:"
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 43 pipeline completed successfully. Post-deployment monitoring gate passed.'
+        }
+
+        failure {
+            echo 'Day 43 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 43 selected DEPLOY_ENV:"
+                echo "$DEPLOY_ENV"
+
+                echo "Final Day 43 SIMULATE_ROLLBACK:"
+                echo "$SIMULATE_ROLLBACK"
+
+                echo "Final Day 43 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 43 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 43 container list:"
+                docker ps -a --filter "name=day43_" || true
+
+                echo "Final Day 43 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 43 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 43 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 43 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
