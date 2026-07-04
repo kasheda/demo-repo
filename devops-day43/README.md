@@ -14,3 +14,7 @@ STABILITY_CHECK_WINDOW_SECONDS
 STABILITY_CHECK_INTERVAL_SECONDS
 Jenkins monitoring loop
 Rollback-aware stability verification
+
+## Post-Deployment Monitoring Gate
+
+Day 43 includes a post-deployment monitoring gate that checks backend stability after deployment.
