@@ -1,0 +1,985 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'PROMOTE_TO_PRODLIKE',
+            choices: ['false', 'true'],
+            description: 'Promote Day 46 release to prodlike after staging validation and release notes pass.'
+        )
+
+        choice(
+            name: 'FORCE_STAGING_STABILITY_FAILURE',
+            choices: ['false', 'true'],
+            description: 'Force staging stability failure to prove promotion is blocked.'
+        )
+
+        choice(
+            name: 'SKIP_RELEASE_NOTES',
+            choices: ['false', 'true'],
+            description: 'When true, release notes are not generated and promotion must be blocked.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 46'
+        PROJECT_DIR = 'devops-day46'
+        STAGING_ENV_FILE = '.env.staging.runtime'
+        PRODLIKE_ENV_FILE = '.env.prodlike.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day46_backend'
+        FRONTEND_CONTAINER = 'day46_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        RELEASE_NOTES_DIR = 'release-notes'
+        RELEASE_NOTES_MD = 'release-notes/day46-release-notes.md'
+        CHANGE_RECORD_JSON = 'release-notes/day46-change-record.json'
+        AUDIT_JSON = 'deployment-audit/day46-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day46-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day46-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day46-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 46...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Day 46 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 46 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 46 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+release-notes/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 46 file: $file"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 46 file: $file"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 46 Runtime Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    CHANGE_RECORD_ID="DAY46-CHANGE-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    STAGING_IMAGE_TAG="day46-staging-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    PRODLIKE_IMAGE_TAG="day46-prodlike-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day46-staging-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                      RELEASE_NOTES_STATUS="draft"
+                    else
+                      RELEASE_NOTES_STATUS="generated"
+                    fi
+
+                    grep -v '^DAY46_BUILD_NUMBER=' .env.staging \
+                      | grep -v '^DAY46_GIT_COMMIT=' \
+                      | grep -v '^DAY46_IMAGE_TAG=' \
+                      | grep -v '^DAY46_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY46_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY46_ROLLBACK_MODE=' \
+                      | grep -v '^DAY46_FORCE_STABILITY_FAILURE=' \
+                      | grep -v '^DAY46_PROMOTION_APPROVED=' \
+                      | grep -v '^DAY46_CHANGE_RECORD_ID=' \
+                      | grep -v '^DAY46_RELEASE_NOTES_STATUS=' > "$STAGING_ENV_FILE"
+
+                    {
+                      echo "DAY46_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY46_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY46_IMAGE_TAG=$STAGING_IMAGE_TAG"
+                      echo "DAY46_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY46_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY46_ROLLBACK_MODE=normal"
+                      echo "DAY46_FORCE_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                      echo "DAY46_PROMOTION_APPROVED=$PROMOTE_TO_PRODLIKE"
+                      echo "DAY46_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                      echo "DAY46_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS"
+                    } >> "$STAGING_ENV_FILE"
+
+                    grep -v '^DAY46_BUILD_NUMBER=' .env.prodlike \
+                      | grep -v '^DAY46_GIT_COMMIT=' \
+                      | grep -v '^DAY46_IMAGE_TAG=' \
+                      | grep -v '^DAY46_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY46_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY46_ROLLBACK_MODE=' \
+                      | grep -v '^DAY46_CHANGE_RECORD_ID=' \
+                      | grep -v '^DAY46_RELEASE_NOTES_STATUS=' > "$PRODLIKE_ENV_FILE"
+
+                    {
+                      echo "DAY46_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY46_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY46_IMAGE_TAG=$PRODLIKE_IMAGE_TAG"
+                      echo "DAY46_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY46_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY46_ROLLBACK_MODE=normal"
+                      echo "DAY46_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                      echo "DAY46_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS"
+                    } >> "$PRODLIKE_ENV_FILE"
+
+                    grep -v '^DAY46_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY46_GIT_COMMIT=' \
+                      | grep -v '^DAY46_IMAGE_TAG=' \
+                      | grep -v '^DAY46_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY46_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY46_ROLLBACK_MODE=' \
+                      | grep -v '^DAY46_CHANGE_RECORD_ID=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY46_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY46_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY46_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY46_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY46_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY46_ROLLBACK_MODE=rollback"
+                      echo "DAY46_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "DAY46_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day46-build-metadata.env
+                    echo "DAY46_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day46-build-metadata.env
+                    echo "DAY46_EXPECTED_STAGING_IMAGE_TAG=$STAGING_IMAGE_TAG" >> day46-build-metadata.env
+                    echo "DAY46_EXPECTED_PRODLIKE_IMAGE_TAG=$PRODLIKE_IMAGE_TAG" >> day46-build-metadata.env
+                    echo "DAY46_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day46-build-metadata.env
+                    echo "DAY46_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day46-build-metadata.env
+                    echo "DAY46_EXPECTED_CHANGE_RECORD_ID=$CHANGE_RECORD_ID" >> day46-build-metadata.env
+                    echo "DAY46_EXPECTED_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS" >> day46-build-metadata.env
+
+                    echo "Day 46 staging runtime env:"
+                    cat "$STAGING_ENV_FILE"
+
+                    echo "Day 46 prodlike runtime env:"
+                    cat "$PRODLIKE_ENV_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 46 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_STAGING_IMAGE_TAG = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_STAGING_IMAGE_TAG").trim()
+                        env.EXPECTED_PRODLIKE_IMAGE_TAG = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_PRODLIKE_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_RELEASE_CREATED_AT").trim()
+                        env.EXPECTED_CHANGE_RECORD_ID = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_CHANGE_RECORD_ID").trim()
+                        env.EXPECTED_RELEASE_NOTES_STATUS = sh(returnStdout: true, script: ". ./day46-build-metadata.env && echo \$DAY46_EXPECTED_RELEASE_NOTES_STATUS").trim()
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 46 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    node --check app.js
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 46 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DAY46_APP_ENV=day46-staging-env" .env.staging
+                    grep "DAY46_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY46_PROMOTION_TARGET=prodlike" .env.staging
+                    grep "DAY46_RELEASE_NOTES_REQUIRED=true" .env.staging
+
+                    grep "DAY46_APP_ENV=day46-prodlike-env" .env.prodlike
+                    grep "DAY46_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY46_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY46_RELEASE_NOTES_STATUS=generated" .env.prodlike
+
+                    grep "DAY46_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY46_RELEASE_NOTES_REQUIRED=false" .env.rollback
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 46 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day46-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day46-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day46-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day46-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day46-env-example-keys.txt
+
+                    diff -u day46-env-example-keys.txt day46-env-keys.txt
+                    diff -u day46-env-example-keys.txt day46-staging-env-keys.txt
+                    diff -u day46-env-example-keys.txt day46-prodlike-env-keys.txt
+                    diff -u day46-env-example-keys.txt day46-rollback-env-keys.txt
+
+                    rm -f day46-env-keys.txt day46-staging-env-keys.txt day46-prodlike-env-keys.txt day46-rollback-env-keys.txt day46-env-example-keys.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 46 Release Notes Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "CHANGE_RECORD_ID" backend/app.js
+                    grep "RELEASE_NOTES_REQUIRED" backend/app.js
+                    grep "RELEASE_NOTES_STATUS" backend/app.js
+                    grep "app.get('/api/change-record'" backend/app.js
+                    grep "changeRecordReady" backend/app.js
+                    grep "release-notes" Jenkinsfile
+                    grep "SKIP_RELEASE_NOTES" Jenkinsfile
+                    grep "Release Notes and Change Record Gate" README.md
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 46 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    set +e
+                    env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day46-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day46-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 46 backend unexpectedly started without required environment variables."
+                      rm -f day46-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day46-missing-env.log
+                    grep "CHANGE_RECORD_ID" day46-missing-env.log
+                    grep "RELEASE_NOTES_STATUS" day46-missing-env.log
+
+                    rm -f day46-missing-env.log
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 46 Release Notes') {
+            when {
+                expression {
+                    return params.SKIP_RELEASE_NOTES == 'false'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$RELEASE_NOTES_DIR"
+
+                    cat > "$RELEASE_NOTES_MD" <<EOF
+# Day 46 Release Notes
+
+## Release Summary
+
+Day 46 adds a release notes and change record gate before prodlike promotion.
+
+## Build Metadata
+
+- Jenkins build number: $EXPECTED_BUILD_NUMBER
+- Git commit: $EXPECTED_GIT_COMMIT
+- Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+- Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+- Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+- Release created at: $EXPECTED_RELEASE_CREATED_AT
+- Change record ID: $EXPECTED_CHANGE_RECORD_ID
+
+## Validation Evidence
+
+- Staging image built
+- Prodlike image built
+- Rollback image built
+- Staging monitoring gate required
+- Promotion readiness required
+- Release notes required
+- Audit bundle required
+
+## Promotion Decision Inputs
+
+- PROMOTE_TO_PRODLIKE: $PROMOTE_TO_PRODLIKE
+- FORCE_STAGING_STABILITY_FAILURE: $FORCE_STAGING_STABILITY_FAILURE
+- SKIP_RELEASE_NOTES: $SKIP_RELEASE_NOTES
+EOF
+
+                    cat > "$CHANGE_RECORD_JSON" <<EOF
+{
+  "day": "Day 46",
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "gitCommit": "$EXPECTED_GIT_COMMIT",
+  "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+  "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+  "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+  "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT",
+  "releaseNotesStatus": "generated",
+  "promotionRequested": "$PROMOTE_TO_PRODLIKE",
+  "stagingFailureForced": "$FORCE_STAGING_STABILITY_FAILURE"
+}
+EOF
+
+                    grep "Day 46 Release Notes" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_CHANGE_RECORD_ID" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_STAGING_IMAGE_TAG" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_PRODLIKE_IMAGE_TAG" "$RELEASE_NOTES_MD"
+
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" "$CHANGE_RECORD_JSON"
+                    grep "\\"releaseNotesStatus\\": \\"generated\\"" "$CHANGE_RECORD_JSON"
+
+                    echo "Day 46 release notes and change record generated."
+                    '''
+                }
+            }
+        }
+
+        stage('Block Day 46 If Release Notes Missing') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                      echo "SKIP_RELEASE_NOTES=true"
+                      echo "Release notes were intentionally skipped."
+
+                      if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                        echo "Promotion requested, but release notes are missing. Blocking promotion."
+                        exit 1
+                      fi
+
+                      echo "No promotion requested, so missing release notes are allowed for this staging-only run."
+                    else
+                      test -f "$RELEASE_NOTES_MD"
+                      test -f "$CHANGE_RECORD_JSON"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$RELEASE_NOTES_MD"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$CHANGE_RECORD_JSON"
+                      echo "Release notes gate passed."
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 46 Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" build --no-cache
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" build --no-cache
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker run --rm "day46-backend:$EXPECTED_STAGING_IMAGE_TAG" cat /app/release.json | tee day46-staging-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_STAGING_IMAGE_TAG\\"" day46-staging-release.json
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" day46-staging-release.json
+                    grep "\\"releaseNotesStatus\\": \\"$EXPECTED_RELEASE_NOTES_STATUS\\"" day46-staging-release.json
+
+                    docker run --rm "day46-backend:$EXPECTED_PRODLIKE_IMAGE_TAG" cat /app/release.json | tee day46-prodlike-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_PRODLIKE_IMAGE_TAG\\"" day46-prodlike-release.json
+                    grep "\\"deployTarget\\": \\"prodlike\\"" day46-prodlike-release.json
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" day46-prodlike-release.json
+
+                    rm -f day46-staging-release.json day46-prodlike-release.json
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 46 Staging Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$STAGING_ENV_FILE" up -d
+
+                    docker ps --filter "name=day46_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 46 Staging Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Day 46 Staging Monitoring Gate') {
+            steps {
+                sh '''
+                set -e
+
+                MONITOR_RESULT_FILE="day46-staging-monitor-result.env"
+                STABILITY_LOG="day46-staging-stability-checks.log"
+
+                rm -f "$MONITOR_RESULT_FILE" "$STABILITY_LOG"
+
+                CHECK_NUMBER=1
+                TOTAL_CHECKS=3
+                MONITORING_FAILED=false
+
+                while [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; do
+                  echo "Day 46 staging stability check $CHECK_NUMBER of $TOTAL_CHECKS"
+
+                  set +e
+                  STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-staging-stability-gate-$CHECK_NUMBER' http://127.0.0.1:3000/api/stability")
+                  STABILITY_EXIT_CODE=$?
+                  set -e
+
+                  {
+                    echo "===== staging stability check $CHECK_NUMBER ====="
+                    echo "exitCode=$STABILITY_EXIT_CODE"
+                    echo "$STABILITY_RESPONSE"
+                  } >> "$STABILITY_LOG"
+
+                  if [ "$STABILITY_EXIT_CODE" -ne 0 ]; then
+                    MONITORING_FAILED=true
+                    break
+                  fi
+
+                  echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                  echo "$STABILITY_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                  CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+                  if [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; then
+                    sleep 5
+                  fi
+                done
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "DAY46_STAGING_MONITORING_RESULT=failed" > "$MONITOR_RESULT_FILE"
+                else
+                  echo "DAY46_STAGING_MONITORING_RESULT=passed" > "$MONITOR_RESULT_FILE"
+                fi
+
+                cat "$MONITOR_RESULT_FILE"
+                cat "$STABILITY_LOG"
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "Day 46 staging monitoring failed. Promotion must be blocked."
+                  exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('Verify Day 46 Change Record And Promotion Readiness') {
+            steps {
+                sh '''
+                set -e
+
+                CHANGE_RECORD_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-change-record-smoke' http://127.0.0.1:3000/api/change-record")
+                PROMOTION_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-promotion-ready-smoke' http://127.0.0.1:3000/api/promotion-ready")
+
+                echo "$CHANGE_RECORD_RESPONSE"
+                echo "$PROMOTION_RESPONSE"
+
+                echo "$CHANGE_RECORD_RESPONSE" | grep '"service":"day46-backend"'
+                echo "$CHANGE_RECORD_RESPONSE" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+
+                if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                  echo "$CHANGE_RECORD_RESPONSE" | grep '"releaseNotesStatus":"draft"'
+                else
+                  echo "$CHANGE_RECORD_RESPONSE" | grep '"releaseNotesStatus":"generated"'
+                  echo "$CHANGE_RECORD_RESPONSE" | grep '"changeRecordReady":true'
+                fi
+
+                echo "$PROMOTION_RESPONSE" | grep '"deployTarget":"staging"'
+                echo "$PROMOTION_RESPONSE" | grep '"promotionTarget":"prodlike"'
+                echo "$PROMOTION_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":true'
+                  echo "$PROMOTION_RESPONSE" | grep '"releaseNotesReady":true'
+                else
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":false'
+                fi
+                '''
+            }
+        }
+
+        stage('Promote Day 46 To Prodlike') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'true'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Promoting Day 46 release to prodlike simulation..."
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" up -d
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "DAY46_PROMOTION_PERFORMED=true" > ../day46-promotion-result.env
+                    '''
+                }
+            }
+        }
+
+        stage('Record Day 46 No Promotion') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'false'
+                }
+            }
+            steps {
+                sh '''
+                set -e
+                echo "DAY46_PROMOTION_PERFORMED=false" > day46-promotion-result.env
+                cat day46-promotion-result.env
+                '''
+            }
+        }
+
+        stage('Verify Day 46 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                PROMOTION_PERFORMED=$(grep DAY46_PROMOTION_PERFORMED day46-promotion-result.env | cut -d '=' -f 2)
+
+                FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-final-config' http://127.0.0.1:3000/api/config")
+                FINAL_CHANGE_RECORD=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-final-change-record' http://127.0.0.1:3000/api/change-record")
+                FINAL_STABILITY=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-final-stability' http://127.0.0.1:3000/api/stability")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "$FINAL_CONFIG"
+                echo "$FINAL_CHANGE_RECORD"
+                echo "$FINAL_STABILITY"
+                echo "$FINAL_IMAGE"
+
+                if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                  echo "$FINAL_CONFIG" | grep '"environment":"day46-prodlike-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"prodlike"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_PRODLIKE_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day46-backend:$EXPECTED_PRODLIKE_IMAGE_TAG"
+                else
+                  echo "$FINAL_CONFIG" | grep '"environment":"day46-staging-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"staging"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_STAGING_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day46-backend:$EXPECTED_STAGING_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_CHANGE_RECORD" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+                echo "$FINAL_CHANGE_RECORD" | grep '"releaseNotesStatus":"generated"'
+                echo "$FINAL_STABILITY" | grep '"stable":true'
+                echo "$FINAL_STABILITY" | grep '"releaseManifestMatchesRuntime":true'
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 46 API Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-api-smoke' http://127.0.0.1:3000/api/message")
+                METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-metrics-smoke' http://127.0.0.1:3000/metrics")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$METRICS_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 46 backend API'
+                echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                echo "$METRICS_RESPONSE" | grep '"/api/change-record"'
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 46'
+                echo "$PAGE_RESPONSE" | grep 'release notes and change record'
+                '''
+            }
+        }
+
+        stage('Verify Day 46 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day46-api-smoke'
+                echo "$LOGS" | grep 'day46-final-config'
+                echo "$LOGS" | grep 'day46-final-change-record'
+                echo "$LOGS" | grep "$EXPECTED_CHANGE_RECORD_ID"
+                '''
+            }
+        }
+
+        stage('Write Day 46 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    PROMOTION_PERFORMED=$(grep DAY46_PROMOTION_PERFORMED ../day46-promotion-result.env | cut -d '=' -f 2)
+
+                    FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-audit-config' http://127.0.0.1:3000/api/config")
+                    FINAL_CHANGE_RECORD=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day46-audit-change-record' http://127.0.0.1:3000/api/change-record")
+
+                    if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_PRODLIKE_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="prodlike"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_STAGING_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="staging"
+                    fi
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 46",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "promoteToProdlike": "$PROMOTE_TO_PRODLIKE",
+  "forceStagingStabilityFailure": "$FORCE_STAGING_STABILITY_FAILURE",
+  "skipReleaseNotes": "$SKIP_RELEASE_NOTES",
+  "promotionPerformed": $PROMOTION_PERFORMED,
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "releaseNotesStatus": "$EXPECTED_RELEASE_NOTES_STATUS",
+  "releaseNotesFile": "$RELEASE_NOTES_MD",
+  "changeRecordFile": "$CHANGE_RECORD_JSON",
+  "expected": {
+    "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+    "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalDeployTarget": "$FINAL_DEPLOY_TARGET",
+    "gitCommit": "$EXPECTED_GIT_COMMIT",
+    "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT"
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "releaseNotesGenerated": true,
+    "changeRecordGenerated": true,
+    "stagingBuilt": true,
+    "prodlikeBuilt": true,
+    "stagingMonitoringPassed": true,
+    "promotionGateEvaluated": true,
+    "promotionPerformed": $PROMOTION_PERFORMED,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 46 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+
+Promote to prodlike: $PROMOTE_TO_PRODLIKE
+Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE
+Skip release notes: $SKIP_RELEASE_NOTES
+Promotion performed: $PROMOTION_PERFORMED
+
+Change record ID: $EXPECTED_CHANGE_RECORD_ID
+Release notes status: $EXPECTED_RELEASE_NOTES_STATUS
+Release notes file: $RELEASE_NOTES_MD
+Change record file: $CHANGE_RECORD_JSON
+
+Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final deploy target: $FINAL_DEPLOY_TARGET
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Final config response:
+$FINAL_CONFIG
+
+Final change record response:
+$FINAL_CHANGE_RECORD
+EOF
+
+                    cp ../day46-staging-stability-checks.log "$AUDIT_DIR/day46-staging-stability-checks.log" 2>/dev/null || true
+
+                    grep "\\"day\\": \\"Day 46\\"" "$AUDIT_JSON"
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" "$AUDIT_JSON"
+                    grep "\\"releaseNotesGenerated\\": true" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+                    grep "\\"releaseManifestMatchesRuntime\\": true" "$AUDIT_JSON"
+
+                    grep "Day 46 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "$EXPECTED_CHANGE_RECORD_ID" "$AUDIT_TEXT"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 46 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day46-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day46-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day46-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 46 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Promote to prodlike: $PROMOTE_TO_PRODLIKE"
+                      echo "Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE"
+                      echo "Skip release notes: $SKIP_RELEASE_NOTES"
+                      echo "Change record ID: $EXPECTED_CHANGE_RECORD_ID"
+                      echo "Staging image tag: $EXPECTED_STAGING_IMAGE_TAG"
+                      echo "Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" "$RELEASE_NOTES_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day46-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day46-running-release.json" \
+                      "$AUDIT_DIR/day46-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day46-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day46-evidence-summary.txt" \
+                      "$RELEASE_NOTES_MD" \
+                      "$CHANGE_RECORD_JSON" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day46-running-release.json" \
+                      "$AUDIT_DIR/day46-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day46-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day46-evidence-summary.txt" \
+                      "$RELEASE_NOTES_MD" \
+                      "$CHANGE_RECORD_JSON"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day46-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day46-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day46-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day46-release-notes.md"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day46-change-record.json"
+
+                    sha256sum -c "$CHECKSUM_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 46 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day46-*,release-notes/day46-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 46 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "PROMOTE_TO_PRODLIKE=$PROMOTE_TO_PRODLIKE"
+                    echo "FORCE_STAGING_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                    echo "SKIP_RELEASE_NOTES=$SKIP_RELEASE_NOTES"
+                    echo "EXPECTED_CHANGE_RECORD_ID=$EXPECTED_CHANGE_RECORD_ID"
+
+                    ls -la "$AUDIT_DIR"
+                    ls -la "$RELEASE_NOTES_DIR"
+
+                    docker ps -a --filter "name=day46_"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 46 pipeline completed successfully. Release notes and change record gate verified.'
+        }
+
+        failure {
+            echo 'Day 46 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 46 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 46 release notes files:"
+                ls -la "$RELEASE_NOTES_DIR" || true
+
+                echo "Final Day 46 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 46 container list:"
+                docker ps -a --filter "name=day46_" || true
+
+                echo "Final Day 46 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 46 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 46 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 46 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
