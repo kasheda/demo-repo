@@ -1,0 +1,843 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['staging', 'dev', 'prodlike'],
+            description: 'Choose which Day 44 environment Jenkins should deploy.'
+        )
+
+        choice(
+            name: 'AUTO_ROLLBACK_ON_FAILURE',
+            choices: ['true', 'false'],
+            description: 'Automatically roll back if Day 44 monitoring gate fails.'
+        )
+
+        choice(
+            name: 'FORCE_CANDIDATE_STABILITY_FAILURE',
+            choices: ['false', 'true'],
+            description: 'When true, candidate /api/stability fails so rollback can be tested.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 44'
+        PROJECT_DIR = 'devops-day44'
+        RUNTIME_ENV_FILE = '.env.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day44_backend'
+        FRONTEND_CONTAINER = 'day44_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        AUDIT_JSON = 'deployment-audit/day44-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day44-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day44-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day44-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 44...'
+                checkout scm
+            }
+        }
+
+        stage('Select Day 44 Environment File') {
+            steps {
+                script {
+                    if (params.DEPLOY_ENV == 'dev') {
+                        env.BASE_ENV_FILE = '.env'
+                        env.EXPECTED_APP_ENV = 'day44-dev-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'dev'
+                        env.EXPECTED_APP_VERSION = 'day44-dev-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8044'
+                    } else if (params.DEPLOY_ENV == 'staging') {
+                        env.BASE_ENV_FILE = '.env.staging'
+                        env.EXPECTED_APP_ENV = 'day44-staging-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'staging'
+                        env.EXPECTED_APP_VERSION = 'day44-staging-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'enabled'
+                        env.EXPECTED_FRONTEND_PORT = '8144'
+                    } else if (params.DEPLOY_ENV == 'prodlike') {
+                        env.BASE_ENV_FILE = '.env.prodlike'
+                        env.EXPECTED_APP_ENV = 'day44-prodlike-env'
+                        env.EXPECTED_DEPLOY_TARGET = 'prodlike'
+                        env.EXPECTED_APP_VERSION = 'day44-prodlike-v1'
+                        env.EXPECTED_FEATURE_FLAG = 'disabled'
+                        env.EXPECTED_FRONTEND_PORT = '8244'
+                    } else {
+                        error "Unsupported Day 44 DEPLOY_ENV: ${params.DEPLOY_ENV}"
+                    }
+
+                    echo "Day 44 selected DEPLOY_ENV=${params.DEPLOY_ENV}"
+                    echo "AUTO_ROLLBACK_ON_FAILURE=${params.AUTO_ROLLBACK_ON_FAILURE}"
+                    echo "FORCE_CANDIDATE_STABILITY_FAILURE=${params.FORCE_CANDIDATE_STABILITY_FAILURE}"
+                }
+            }
+        }
+
+        stage('Validate Day 44 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 44 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 44 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 44 file: $file"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+                      echo "Found Day 44 file: $file"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 44 Runtime Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+
+                    CANDIDATE_IMAGE_TAG="day44-${DEPLOY_ENV}-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day44-${DEPLOY_ENV}-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    grep -v '^DAY44_BUILD_NUMBER=' "$BASE_ENV_FILE" \
+                      | grep -v '^DAY44_GIT_COMMIT=' \
+                      | grep -v '^DAY44_IMAGE_TAG=' \
+                      | grep -v '^DAY44_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY44_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY44_ROLLBACK_MODE=' \
+                      | grep -v '^DAY44_FORCE_STABILITY_FAILURE=' > "$RUNTIME_ENV_FILE"
+
+                    {
+                      echo "DAY44_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY44_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY44_IMAGE_TAG=$CANDIDATE_IMAGE_TAG"
+                      echo "DAY44_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY44_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY44_ROLLBACK_MODE=normal"
+                      echo "DAY44_FORCE_STABILITY_FAILURE=$FORCE_CANDIDATE_STABILITY_FAILURE"
+                    } >> "$RUNTIME_ENV_FILE"
+
+                    grep -v '^DAY44_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY44_GIT_COMMIT=' \
+                      | grep -v '^DAY44_IMAGE_TAG=' \
+                      | grep -v '^DAY44_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY44_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY44_ROLLBACK_MODE=' \
+                      | grep -v '^DAY44_FORCE_STABILITY_FAILURE=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY44_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY44_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY44_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY44_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY44_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY44_ROLLBACK_MODE=rollback"
+                      echo "DAY44_FORCE_STABILITY_FAILURE=false"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "Day 44 candidate runtime env file:"
+                    cat "$RUNTIME_ENV_FILE"
+
+                    echo "Day 44 rollback runtime env file:"
+                    cat "$ROLLBACK_ENV_FILE"
+
+                    echo "DAY44_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day44-build-metadata.env
+                    echo "DAY44_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day44-build-metadata.env
+                    echo "DAY44_EXPECTED_IMAGE_TAG=$CANDIDATE_IMAGE_TAG" >> day44-build-metadata.env
+                    echo "DAY44_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day44-build-metadata.env
+                    echo "DAY44_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day44-build-metadata.env
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 44 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day44-build-metadata.env && echo \$DAY44_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day44-build-metadata.env && echo \$DAY44_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_IMAGE_TAG = sh(returnStdout: true, script: ". ./day44-build-metadata.env && echo \$DAY44_EXPECTED_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day44-build-metadata.env && echo \$DAY44_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day44-build-metadata.env && echo \$DAY44_EXPECTED_RELEASE_CREATED_AT").trim()
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 44 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    node --check app.js
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 44 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DAY44_APP_ENV=day44-dev-env" .env
+                    grep "DAY44_DEPLOY_TARGET=dev" .env
+                    grep "DAY44_FRONTEND_PORT=8044" .env
+                    grep "DAY44_FORCE_STABILITY_FAILURE=false" .env
+
+                    grep "DAY44_APP_ENV=day44-staging-env" .env.staging
+                    grep "DAY44_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY44_FRONTEND_PORT=8144" .env.staging
+                    grep "DAY44_FORCE_STABILITY_FAILURE=false" .env.staging
+
+                    grep "DAY44_APP_ENV=day44-prodlike-env" .env.prodlike
+                    grep "DAY44_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY44_FEATURE_FLAG=disabled" .env.prodlike
+
+                    grep "DAY44_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY44_FORCE_STABILITY_FAILURE=false" .env.rollback
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 44 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day44-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day44-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day44-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day44-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day44-env-example-keys.txt
+
+                    diff -u day44-env-example-keys.txt day44-env-keys.txt
+                    diff -u day44-env-example-keys.txt day44-staging-env-keys.txt
+                    diff -u day44-env-example-keys.txt day44-prodlike-env-keys.txt
+                    diff -u day44-env-example-keys.txt day44-rollback-env-keys.txt
+
+                    rm -f day44-env-keys.txt day44-staging-env-keys.txt day44-prodlike-env-keys.txt day44-rollback-env-keys.txt day44-env-example-keys.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 44 Automatic Rollback Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "FORCE_STABILITY_FAILURE" backend/app.js
+                    grep "stability_check_forced_failure" backend/app.js
+                    grep "AUTO_ROLLBACK_ON_FAILURE" Jenkinsfile
+                    grep "FORCE_CANDIDATE_STABILITY_FAILURE" Jenkinsfile
+                    grep "Automatic Rollback" README.md
+                    grep "DAY44_FORCE_STABILITY_FAILURE" docker-compose.yml
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 44 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    set +e
+                    nenv -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day44-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day44-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 44 backend unexpectedly started without required environment variables."
+                      rm -f day44-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day44-missing-env.log
+                    grep "FORCE_STABILITY_FAILURE" day44-missing-env.log
+
+                    rm -f day44-missing-env.log
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 44 Candidate and Rollback Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" build --no-cache
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker run --rm "day44-backend:$EXPECTED_IMAGE_TAG" cat /app/release.json | tee day44-candidate-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_IMAGE_TAG\\"" day44-candidate-release.json
+                    grep "\\"rollbackMode\\": \\"normal\\"" day44-candidate-release.json
+                    grep "\\"forceStabilityFailure\\": \\"$FORCE_CANDIDATE_STABILITY_FAILURE\\"" day44-candidate-release.json
+
+                    docker run --rm "day44-backend:$EXPECTED_ROLLBACK_IMAGE_TAG" cat /app/release.json | tee day44-rollback-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_ROLLBACK_IMAGE_TAG\\"" day44-rollback-release.json
+                    grep "\\"rollbackMode\\": \\"rollback\\"" day44-rollback-release.json
+                    grep "\\"forceStabilityFailure\\": \\"false\\"" day44-rollback-release.json
+
+                    rm -f day44-candidate-release.json day44-rollback-release.json
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 44 Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+                    docker compose --env-file "$RUNTIME_ENV_FILE" up -d
+
+                    docker ps --filter "name=day44_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 44 Candidate Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 44 candidate backend health: $BACKEND_HEALTH"
+                    echo "Day 44 candidate frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=50 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test Day 44 Candidate') {
+            steps {
+                sh '''
+                set -e
+
+                HEALTH_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-health-smoke' http://127.0.0.1:3000/health")
+                ROLLBACK_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-rollback-ready-smoke' http://127.0.0.1:3000/api/rollback-ready")
+
+                echo "$HEALTH_RESPONSE"
+                echo "$ROLLBACK_RESPONSE"
+
+                echo "$HEALTH_RESPONSE" | grep '"status":"ok"'
+                echo "$HEALTH_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+                echo "$HEALTH_RESPONSE" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+
+                echo "$ROLLBACK_RESPONSE" | grep '"rollbackReady":true'
+                echo "$ROLLBACK_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                echo "$ROLLBACK_RESPONSE" | grep "\\"rollbackImageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                '''
+            }
+        }
+
+        stage('Day 44 Candidate Monitoring Gate') {
+            steps {
+                sh '''
+                set -e
+
+                echo "Running Day 44 candidate monitoring gate..."
+
+                MONITOR_RESULT_FILE="day44-monitor-result.env"
+                STABILITY_LOG="day44-stability-checks.log"
+
+                rm -f "$MONITOR_RESULT_FILE" "$STABILITY_LOG"
+
+                CHECK_NUMBER=1
+                TOTAL_CHECKS=3
+                MONITORING_FAILED=false
+
+                while [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; do
+                  echo "Day 44 stability check $CHECK_NUMBER of $TOTAL_CHECKS"
+
+                  set +e
+                  STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-stability-gate-$CHECK_NUMBER' http://127.0.0.1:3000/api/stability")
+                  STABILITY_EXIT_CODE=$?
+                  set -e
+
+                  {
+                    echo "===== stability check $CHECK_NUMBER ====="
+                    echo "exitCode=$STABILITY_EXIT_CODE"
+                    echo "$STABILITY_RESPONSE"
+                  } >> "$STABILITY_LOG"
+
+                  if [ "$STABILITY_EXIT_CODE" -ne 0 ]; then
+                    echo "Day 44 stability endpoint failed on check $CHECK_NUMBER."
+                    MONITORING_FAILED=true
+                    break
+                  fi
+
+                  echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                  echo "$STABILITY_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                  CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+                  if [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; then
+                    sleep 5
+                  fi
+                done
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "DAY44_MONITORING_RESULT=failed" > "$MONITOR_RESULT_FILE"
+                else
+                  echo "DAY44_MONITORING_RESULT=passed" > "$MONITOR_RESULT_FILE"
+                fi
+
+                cat "$MONITOR_RESULT_FILE"
+                cat "$STABILITY_LOG"
+
+                if [ "$MONITORING_FAILED" = "true" ] && [ "$AUTO_ROLLBACK_ON_FAILURE" = "false" ]; then
+                  echo "Monitoring failed and AUTO_ROLLBACK_ON_FAILURE=false. Failing pipeline."
+                  exit 1
+                fi
+
+                echo "Day 44 candidate monitoring gate finished."
+                '''
+            }
+        }
+
+        stage('Automatic Day 44 Rollback If Monitoring Failed') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    MONITOR_RESULT=$(grep DAY44_MONITORING_RESULT ../day44-monitor-result.env | cut -d '=' -f 2)
+
+                    echo "Day 44 monitor result: $MONITOR_RESULT"
+                    echo "AUTO_ROLLBACK_ON_FAILURE=$AUTO_ROLLBACK_ON_FAILURE"
+
+                    if [ "$MONITOR_RESULT" = "failed" ] && [ "$AUTO_ROLLBACK_ON_FAILURE" = "true" ]; then
+                      echo "Automatic rollback triggered."
+
+                      docker compose --env-file "$RUNTIME_ENV_FILE" down || true
+                      docker compose --env-file "$ROLLBACK_ENV_FILE" up -d
+
+                      BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                      FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                      if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                        docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                        exit 1
+                      fi
+
+                      if [ "$FRONTEND_RUNNING" != "true" ]; then
+                        docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                        exit 1
+                      fi
+
+                      echo "DAY44_ROLLBACK_PERFORMED=true" > ../day44-rollback-result.env
+                    else
+                      echo "No automatic rollback needed."
+                      echo "DAY44_ROLLBACK_PERFORMED=false" > ../day44-rollback-result.env
+                    fi
+
+                    cat ../day44-rollback-result.env
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 44 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                FINAL_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-final-rollback-ready' http://127.0.0.1:3000/api/rollback-ready")
+                FINAL_STABILITY=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-final-stability' http://127.0.0.1:3000/api/stability")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                ROLLBACK_PERFORMED=$(grep DAY44_ROLLBACK_PERFORMED day44-rollback-result.env | cut -d '=' -f 2)
+
+                echo "$FINAL_RESPONSE"
+                echo "$FINAL_STABILITY"
+                echo "$FINAL_IMAGE"
+                echo "ROLLBACK_PERFORMED=$ROLLBACK_PERFORMED"
+
+                if [ "$ROLLBACK_PERFORMED" = "true" ]; then
+                  echo "$FINAL_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                  echo "$FINAL_RESPONSE" | grep '"rollbackMode":"rollback"'
+                  echo "$FINAL_IMAGE" | grep "day44-backend:$EXPECTED_ROLLBACK_IMAGE_TAG"
+                else
+                  echo "$FINAL_RESPONSE" | grep "\\"currentImageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                  echo "$FINAL_RESPONSE" | grep '"rollbackMode":"normal"'
+                  echo "$FINAL_IMAGE" | grep "day44-backend:$EXPECTED_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_STABILITY" | grep '"stable":true'
+                echo "$FINAL_STABILITY" | grep '"releaseManifestMatchesRuntime":true'
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 44 API Config Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-api-smoke' http://127.0.0.1:3000/api/message")
+                CONFIG_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-config-smoke' http://127.0.0.1:3000/api/config")
+                METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-metrics-smoke' http://127.0.0.1:3000/metrics")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$CONFIG_RESPONSE"
+                echo "$METRICS_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 44 backend API'
+                echo "$CONFIG_RESPONSE" | grep '"service":"day44-backend"'
+                echo "$CONFIG_RESPONSE" | grep "\\"environment\\":\\"$EXPECTED_APP_ENV\\""
+                echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 44'
+                echo "$PAGE_RESPONSE" | grep 'automatic rollback'
+                '''
+            }
+        }
+
+        stage('Verify Day 44 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+                ROLLBACK_PERFORMED=$(grep DAY44_ROLLBACK_PERFORMED day44-rollback-result.env | cut -d '=' -f 2)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day44-api-smoke'
+                echo "$LOGS" | grep 'day44-config-smoke'
+                echo "$LOGS" | grep "\\"deployTarget\\":\\"$EXPECTED_DEPLOY_TARGET\\""
+
+                if [ "$ROLLBACK_PERFORMED" = "true" ]; then
+                  echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_ROLLBACK_IMAGE_TAG\\""
+                  echo "$LOGS" | grep "\\"rollbackMode\\":\\"rollback\\""
+                else
+                  echo "$LOGS" | grep "\\"imageTag\\":\\"$EXPECTED_IMAGE_TAG\\""
+                  echo "$LOGS" | grep "\\"rollbackMode\\":\\"normal\\""
+                fi
+                '''
+            }
+        }
+
+        stage('Write Day 44 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    MONITOR_RESULT=$(grep DAY44_MONITORING_RESULT ../day44-monitor-result.env | cut -d '=' -f 2)
+                    ROLLBACK_PERFORMED=$(grep DAY44_ROLLBACK_PERFORMED ../day44-rollback-result.env | cut -d '=' -f 2)
+
+                    if [ "$ROLLBACK_PERFORMED" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_ROLLBACK_IMAGE_TAG"
+                      FINAL_ROLLBACK_MODE="rollback"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_IMAGE_TAG"
+                      FINAL_ROLLBACK_MODE="normal"
+                    fi
+
+                    FINAL_STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day44-audit-stability' http://127.0.0.1:3000/api/stability")
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 44",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "deployEnvParameter": "$DEPLOY_ENV",
+  "autoRollbackOnFailure": "$AUTO_ROLLBACK_ON_FAILURE",
+  "forceCandidateStabilityFailure": "$FORCE_CANDIDATE_STABILITY_FAILURE",
+  "candidateMonitoringResult": "$MONITOR_RESULT",
+  "rollbackPerformed": $ROLLBACK_PERFORMED,
+  "expected": {
+    "candidateImageTag": "$EXPECTED_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalRollbackMode": "$FINAL_ROLLBACK_MODE",
+    "appEnvironment": "$EXPECTED_APP_ENV",
+    "deployTarget": "$EXPECTED_DEPLOY_TARGET",
+    "appVersion": "$EXPECTED_APP_VERSION",
+    "gitCommit": "$EXPECTED_GIT_COMMIT"
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "candidateBuilt": true,
+    "rollbackImageBuilt": true,
+    "candidateMonitoringCompleted": true,
+    "automaticRollbackSupported": true,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 44 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+Deploy environment parameter: $DEPLOY_ENV
+
+Automatic rollback on failure: $AUTO_ROLLBACK_ON_FAILURE
+Force candidate stability failure: $FORCE_CANDIDATE_STABILITY_FAILURE
+Candidate monitoring result: $MONITOR_RESULT
+Rollback performed: $ROLLBACK_PERFORMED
+
+Candidate image tag: $EXPECTED_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final rollback mode: $FINAL_ROLLBACK_MODE
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Final stability response:
+$FINAL_STABILITY_RESPONSE
+EOF
+
+                    cp ../day44-stability-checks.log "$AUDIT_DIR/day44-stability-checks.log" 2>/dev/null || true
+
+                    grep "\\"day\\": \\"Day 44\\"" "$AUDIT_JSON"
+                    grep "\\"automaticRollbackSupported\\": true" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+                    grep "\\"releaseManifestMatchesRuntime\\": true" "$AUDIT_JSON"
+
+                    grep "Day 44 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "Automatic rollback on failure" "$AUDIT_TEXT"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 44 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day44-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day44-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day44-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 44 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Deploy env: $DEPLOY_ENV"
+                      echo "Auto rollback on failure: $AUTO_ROLLBACK_ON_FAILURE"
+                      echo "Force candidate stability failure: $FORCE_CANDIDATE_STABILITY_FAILURE"
+                      echo "Candidate image tag: $EXPECTED_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day44-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day44-running-release.json" \
+                      "$AUDIT_DIR/day44-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day44-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day44-evidence-summary.txt" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day44-running-release.json" \
+                      "$AUDIT_DIR/day44-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day44-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day44-evidence-summary.txt"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day44-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day44-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day44-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day44-running-release.json"
+
+                    sha256sum -c "$CHECKSUM_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 44 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day44-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 44 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Day 44 selected DEPLOY_ENV: $DEPLOY_ENV"
+                    echo "AUTO_ROLLBACK_ON_FAILURE: $AUTO_ROLLBACK_ON_FAILURE"
+                    echo "FORCE_CANDIDATE_STABILITY_FAILURE: $FORCE_CANDIDATE_STABILITY_FAILURE"
+                    echo "Candidate tag: $EXPECTED_IMAGE_TAG"
+                    echo "Rollback tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+
+                    ls -la "$AUDIT_DIR"
+
+                    docker ps -a --filter "name=day44_"
+
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 44 pipeline completed successfully. Automatic rollback behavior verified.'
+        }
+
+        failure {
+            echo 'Day 44 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 44 selected DEPLOY_ENV:"
+                echo "$DEPLOY_ENV"
+
+                echo "Final Day 44 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 44 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 44 container list:"
+                docker ps -a --filter "name=day44_" || true
+
+                echo "Final Day 44 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 44 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 44 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 44 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
