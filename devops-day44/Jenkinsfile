@@ -299,7 +299,7 @@ README.md
                     set -e
 
                     set +e
-                    nenv -u PORT \
+                    env -u PORT \
     -u APP_ENV \
     -u APP_VERSION \
     -u SERVICE_NAME \
