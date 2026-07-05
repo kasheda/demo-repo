@@ -112,3 +112,12 @@ A release should also have:
 Day 46 teaches the DevOps rule:
 
     A promoted release should explain what changed and leave evidence that it was safe to promote.
+## Release Notes and Change Record Gate
+
+Day 46 demonstrates a release notes and change record gate before promotion.
+
+The pipeline generates release notes and a change record for each build.
+
+Promotion is allowed only when the change record is valid, release notes are generated, the staging deployment is healthy, and the promotion gate is approved.
+
+The SKIP_RELEASE_NOTES parameter can be used to test the blocking behavior when release notes are intentionally skipped.
