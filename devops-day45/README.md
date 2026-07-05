@@ -129,3 +129,13 @@ Promotion should be based on evidence, not hope.
 Day 45 teaches the DevOps rule:
 
     A release should only move forward after the previous environment proves it is healthy and stable.
+
+## Promotion Gate
+
+Day 45 demonstrates a staging-to-prodlike promotion gate.
+
+The application exposes a promotion readiness endpoint at `/api/promotion-ready`.
+
+Promotion is allowed only when the staging deployment is healthy, the release manifest matches the runtime configuration, `DAY45_PROMOTION_TARGET=prodlike`, and `DAY45_PROMOTION_APPROVED=true`.
+
+The Jenkins parameter `PROMOTE_TO_PRODLIKE` controls whether the pipeline promotes the verified staging candidate to the prodlike environment.
