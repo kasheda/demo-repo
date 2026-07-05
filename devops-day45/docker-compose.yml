@@ -1,0 +1,62 @@
+services:
+  day45-backend:
+    build:
+      context: ./backend
+      args:
+        DAY45_SERVICE_NAME: "${DAY45_SERVICE_NAME}"
+        DAY45_DEPLOY_TARGET: "${DAY45_DEPLOY_TARGET}"
+        DAY45_APP_VERSION: "${DAY45_APP_VERSION}"
+        DAY45_BUILD_NUMBER: "${DAY45_BUILD_NUMBER}"
+        DAY45_GIT_COMMIT: "${DAY45_GIT_COMMIT}"
+        DAY45_IMAGE_TAG: "${DAY45_IMAGE_TAG}"
+        DAY45_RELEASE_CREATED_AT: "${DAY45_RELEASE_CREATED_AT}"
+        DAY45_ROLLBACK_IMAGE_TAG: "${DAY45_ROLLBACK_IMAGE_TAG}"
+        DAY45_ROLLBACK_MODE: "${DAY45_ROLLBACK_MODE}"
+        DAY45_STABILITY_CHECK_WINDOW_SECONDS: "${DAY45_STABILITY_CHECK_WINDOW_SECONDS}"
+        DAY45_STABILITY_CHECK_INTERVAL_SECONDS: "${DAY45_STABILITY_CHECK_INTERVAL_SECONDS}"
+        DAY45_FORCE_STABILITY_FAILURE: "${DAY45_FORCE_STABILITY_FAILURE}"
+        DAY45_PROMOTION_TARGET: "${DAY45_PROMOTION_TARGET}"
+        DAY45_PROMOTION_APPROVED: "${DAY45_PROMOTION_APPROVED}"
+    image: day45-backend:${DAY45_IMAGE_TAG}
+    container_name: day45_backend
+    environment:
+      PORT: "${DAY45_BACKEND_PORT}"
+      APP_ENV: "${DAY45_APP_ENV}"
+      DEPLOY_TARGET: "${DAY45_DEPLOY_TARGET}"
+      APP_VERSION: "${DAY45_APP_VERSION}"
+      SERVICE_NAME: "${DAY45_SERVICE_NAME}"
+      FEATURE_FLAG: "${DAY45_FEATURE_FLAG}"
+      LOG_LEVEL: "${DAY45_LOG_LEVEL}"
+      METRICS_ENABLED: "${DAY45_METRICS_ENABLED}"
+      BUILD_NUMBER: "${DAY45_BUILD_NUMBER}"
+      GIT_COMMIT: "${DAY45_GIT_COMMIT}"
+      IMAGE_TAG: "${DAY45_IMAGE_TAG}"
+      RELEASE_CREATED_AT: "${DAY45_RELEASE_CREATED_AT}"
+      ROLLBACK_IMAGE_TAG: "${DAY45_ROLLBACK_IMAGE_TAG}"
+      ROLLBACK_MODE: "${DAY45_ROLLBACK_MODE}"
+      STABILITY_CHECK_WINDOW_SECONDS: "${DAY45_STABILITY_CHECK_WINDOW_SECONDS}"
+      STABILITY_CHECK_INTERVAL_SECONDS: "${DAY45_STABILITY_CHECK_INTERVAL_SECONDS}"
+      FORCE_STABILITY_FAILURE: "${DAY45_FORCE_STABILITY_FAILURE}"
+      PROMOTION_TARGET: "${DAY45_PROMOTION_TARGET}"
+      PROMOTION_APPROVED: "${DAY45_PROMOTION_APPROVED}"
+    ports:
+      - "${DAY45_BACKEND_PORT}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+
+  day45-frontend:
+    build:
+      context: ./frontend
+    image: day45-frontend:${DAY45_IMAGE_TAG}
+    container_name: day45_frontend
+    ports:
+      - "${DAY45_FRONTEND_PORT}:80"
+    depends_on:
+      day45-backend:
+        condition: service_healthy
+    restart: unless-stopped

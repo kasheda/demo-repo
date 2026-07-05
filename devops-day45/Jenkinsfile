@@ -1,0 +1,817 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'PROMOTE_TO_PRODLIKE',
+            choices: ['false', 'true'],
+            description: 'Promote Day 45 release to prodlike after staging validation passes.'
+        )
+
+        choice(
+            name: 'FORCE_STAGING_STABILITY_FAILURE',
+            choices: ['false', 'true'],
+            description: 'Force staging stability failure to prove promotion is blocked.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 45'
+        PROJECT_DIR = 'devops-day45'
+        STAGING_ENV_FILE = '.env.staging.runtime'
+        PRODLIKE_ENV_FILE = '.env.prodlike.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day45_backend'
+        FRONTEND_CONTAINER = 'day45_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        AUDIT_JSON = 'deployment-audit/day45-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day45-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day45-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day45-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 45...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Day 45 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 45 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 45 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 45 file: $file"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 45 file: $file"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 45 Runtime Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+
+                    STAGING_IMAGE_TAG="day45-staging-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    PRODLIKE_IMAGE_TAG="day45-prodlike-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day45-staging-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    grep -v '^DAY45_BUILD_NUMBER=' .env.staging \
+                      | grep -v '^DAY45_GIT_COMMIT=' \
+                      | grep -v '^DAY45_IMAGE_TAG=' \
+                      | grep -v '^DAY45_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY45_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY45_ROLLBACK_MODE=' \
+                      | grep -v '^DAY45_FORCE_STABILITY_FAILURE=' \
+                      | grep -v '^DAY45_PROMOTION_APPROVED=' > "$STAGING_ENV_FILE"
+
+                    {
+                      echo "DAY45_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY45_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY45_IMAGE_TAG=$STAGING_IMAGE_TAG"
+                      echo "DAY45_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY45_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY45_ROLLBACK_MODE=normal"
+                      echo "DAY45_FORCE_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                      echo "DAY45_PROMOTION_APPROVED=$PROMOTE_TO_PRODLIKE"
+                    } >> "$STAGING_ENV_FILE"
+
+                    grep -v '^DAY45_BUILD_NUMBER=' .env.prodlike \
+                      | grep -v '^DAY45_GIT_COMMIT=' \
+                      | grep -v '^DAY45_IMAGE_TAG=' \
+                      | grep -v '^DAY45_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY45_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY45_ROLLBACK_MODE=' > "$PRODLIKE_ENV_FILE"
+
+                    {
+                      echo "DAY45_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY45_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY45_IMAGE_TAG=$PRODLIKE_IMAGE_TAG"
+                      echo "DAY45_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY45_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY45_ROLLBACK_MODE=normal"
+                    } >> "$PRODLIKE_ENV_FILE"
+
+                    grep -v '^DAY45_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY45_GIT_COMMIT=' \
+                      | grep -v '^DAY45_IMAGE_TAG=' \
+                      | grep -v '^DAY45_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY45_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY45_ROLLBACK_MODE=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY45_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY45_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY45_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY45_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY45_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY45_ROLLBACK_MODE=rollback"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "Day 45 staging runtime env:"
+                    cat "$STAGING_ENV_FILE"
+
+                    echo "Day 45 prodlike runtime env:"
+                    cat "$PRODLIKE_ENV_FILE"
+
+                    echo "DAY45_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day45-build-metadata.env
+                    echo "DAY45_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day45-build-metadata.env
+                    echo "DAY45_EXPECTED_STAGING_IMAGE_TAG=$STAGING_IMAGE_TAG" >> day45-build-metadata.env
+                    echo "DAY45_EXPECTED_PRODLIKE_IMAGE_TAG=$PRODLIKE_IMAGE_TAG" >> day45-build-metadata.env
+                    echo "DAY45_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day45-build-metadata.env
+                    echo "DAY45_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day45-build-metadata.env
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 45 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day45-build-metadata.env && echo \$DAY45_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day45-build-metadata.env && echo \$DAY45_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_STAGING_IMAGE_TAG = sh(returnStdout: true, script: ". ./day45-build-metadata.env && echo \$DAY45_EXPECTED_STAGING_IMAGE_TAG").trim()
+                        env.EXPECTED_PRODLIKE_IMAGE_TAG = sh(returnStdout: true, script: ". ./day45-build-metadata.env && echo \$DAY45_EXPECTED_PRODLIKE_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day45-build-metadata.env && echo \$DAY45_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day45-build-metadata.env && echo \$DAY45_EXPECTED_RELEASE_CREATED_AT").trim()
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 45 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    node --check app.js
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 45 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DAY45_APP_ENV=day45-staging-env" .env.staging
+                    grep "DAY45_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY45_PROMOTION_TARGET=prodlike" .env.staging
+                    grep "DAY45_PROMOTION_APPROVED=false" .env.staging
+
+                    grep "DAY45_APP_ENV=day45-prodlike-env" .env.prodlike
+                    grep "DAY45_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY45_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY45_PROMOTION_APPROVED=true" .env.prodlike
+
+                    grep "DAY45_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY45_FORCE_STABILITY_FAILURE=false" .env.rollback
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 45 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day45-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day45-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day45-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day45-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day45-env-example-keys.txt
+
+                    diff -u day45-env-example-keys.txt day45-env-keys.txt
+                    diff -u day45-env-example-keys.txt day45-staging-env-keys.txt
+                    diff -u day45-env-example-keys.txt day45-prodlike-env-keys.txt
+                    diff -u day45-env-example-keys.txt day45-rollback-env-keys.txt
+
+                    rm -f day45-env-keys.txt day45-staging-env-keys.txt day45-prodlike-env-keys.txt day45-rollback-env-keys.txt day45-env-example-keys.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 45 Promotion Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "PROMOTION_TARGET" backend/app.js
+                    grep "PROMOTION_APPROVED" backend/app.js
+                    grep "app.get('/api/promotion-ready'" backend/app.js
+                    grep "promotionReady" backend/app.js
+                    grep "PROMOTE_TO_PRODLIKE" Jenkinsfile
+                    grep "Promotion Gate" README.md
+                    grep "DAY45_PROMOTION_TARGET" docker-compose.yml
+                    grep "DAY45_PROMOTION_APPROVED" docker-compose.yml
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 45 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    set +e
+                    env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day45-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day45-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 45 backend unexpectedly started without required environment variables."
+                      rm -f day45-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day45-missing-env.log
+                    grep "PROMOTION_TARGET" day45-missing-env.log
+                    grep "PROMOTION_APPROVED" day45-missing-env.log
+
+                    rm -f day45-missing-env.log
+                    '''
+                }
+            }
+        }
+
+        stage('Build Day 45 Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" build --no-cache
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" build --no-cache
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker run --rm "day45-backend:$EXPECTED_STAGING_IMAGE_TAG" cat /app/release.json | tee day45-staging-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_STAGING_IMAGE_TAG\\"" day45-staging-release.json
+                    grep "\\"deployTarget\\": \\"staging\\"" day45-staging-release.json
+                    grep "\\"promotionTarget\\": \\"prodlike\\"" day45-staging-release.json
+
+                    docker run --rm "day45-backend:$EXPECTED_PRODLIKE_IMAGE_TAG" cat /app/release.json | tee day45-prodlike-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_PRODLIKE_IMAGE_TAG\\"" day45-prodlike-release.json
+                    grep "\\"deployTarget\\": \\"prodlike\\"" day45-prodlike-release.json
+                    grep "\\"promotionApproved\\": \\"true\\"" day45-prodlike-release.json
+
+                    rm -f day45-staging-release.json day45-prodlike-release.json
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 45 Staging Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$STAGING_ENV_FILE" up -d
+
+                    docker ps --filter "name=day45_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 45 Staging Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 45 staging backend health: $BACKEND_HEALTH"
+                    echo "Day 45 staging frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Day 45 Staging Monitoring Gate') {
+            steps {
+                sh '''
+                set -e
+
+                MONITOR_RESULT_FILE="day45-staging-monitor-result.env"
+                STABILITY_LOG="day45-staging-stability-checks.log"
+
+                rm -f "$MONITOR_RESULT_FILE" "$STABILITY_LOG"
+
+                CHECK_NUMBER=1
+                TOTAL_CHECKS=3
+                MONITORING_FAILED=false
+
+                while [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; do
+                  echo "Day 45 staging stability check $CHECK_NUMBER of $TOTAL_CHECKS"
+
+                  set +e
+                  STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-staging-stability-gate-$CHECK_NUMBER' http://127.0.0.1:3000/api/stability")
+                  STABILITY_EXIT_CODE=$?
+                  set -e
+
+                  {
+                    echo "===== staging stability check $CHECK_NUMBER ====="
+                    echo "exitCode=$STABILITY_EXIT_CODE"
+                    echo "$STABILITY_RESPONSE"
+                  } >> "$STABILITY_LOG"
+
+                  if [ "$STABILITY_EXIT_CODE" -ne 0 ]; then
+                    MONITORING_FAILED=true
+                    break
+                  fi
+
+                  echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                  echo "$STABILITY_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                  CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+                  if [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; then
+                    sleep 5
+                  fi
+                done
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "DAY45_STAGING_MONITORING_RESULT=failed" > "$MONITOR_RESULT_FILE"
+                else
+                  echo "DAY45_STAGING_MONITORING_RESULT=passed" > "$MONITOR_RESULT_FILE"
+                fi
+
+                cat "$MONITOR_RESULT_FILE"
+                cat "$STABILITY_LOG"
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "Day 45 staging monitoring failed. Promotion must be blocked."
+                  exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('Verify Day 45 Promotion Readiness') {
+            steps {
+                sh '''
+                set -e
+
+                PROMOTION_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-promotion-ready-smoke' http://127.0.0.1:3000/api/promotion-ready")
+
+                echo "$PROMOTION_RESPONSE"
+
+                echo "$PROMOTION_RESPONSE" | grep '"service":"day45-backend"'
+                echo "$PROMOTION_RESPONSE" | grep '"deployTarget":"staging"'
+                echo "$PROMOTION_RESPONSE" | grep '"promotionTarget":"prodlike"'
+                echo "$PROMOTION_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":true'
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionApproved":true'
+                else
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":false'
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionApproved":false'
+                fi
+                '''
+            }
+        }
+
+        stage('Promote Day 45 To Prodlike') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'true'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Promoting Day 45 release to prodlike simulation..."
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" up -d
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    echo "Day 45 prodlike backend health: $BACKEND_HEALTH"
+                    echo "Day 45 prodlike frontend running: $FRONTEND_RUNNING"
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "DAY45_PROMOTION_PERFORMED=true" > ../day45-promotion-result.env
+                    '''
+                }
+            }
+        }
+
+        stage('Record Day 45 No Promotion') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'false'
+                }
+            }
+            steps {
+                sh '''
+                set -e
+                echo "DAY45_PROMOTION_PERFORMED=false" > day45-promotion-result.env
+                cat day45-promotion-result.env
+                '''
+            }
+        }
+
+        stage('Verify Day 45 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                PROMOTION_PERFORMED=$(grep DAY45_PROMOTION_PERFORMED day45-promotion-result.env | cut -d '=' -f 2)
+
+                FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-final-config' http://127.0.0.1:3000/api/config")
+                FINAL_PROMOTION=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-final-promotion' http://127.0.0.1:3000/api/promotion-ready")
+                FINAL_STABILITY=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-final-stability' http://127.0.0.1:3000/api/stability")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "$FINAL_CONFIG"
+                echo "$FINAL_PROMOTION"
+                echo "$FINAL_STABILITY"
+                echo "$FINAL_IMAGE"
+
+                if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                  echo "$FINAL_CONFIG" | grep '"environment":"day45-prodlike-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"prodlike"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_PRODLIKE_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day45-backend:$EXPECTED_PRODLIKE_IMAGE_TAG"
+                else
+                  echo "$FINAL_CONFIG" | grep '"environment":"day45-staging-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"staging"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_STAGING_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day45-backend:$EXPECTED_STAGING_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_STABILITY" | grep '"stable":true'
+                echo "$FINAL_STABILITY" | grep '"releaseManifestMatchesRuntime":true'
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 45 API Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-api-smoke' http://127.0.0.1:3000/api/message")
+                METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-metrics-smoke' http://127.0.0.1:3000/metrics")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$METRICS_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 45 backend API'
+                echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                echo "$METRICS_RESPONSE" | grep '"/api/promotion-ready"'
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 45'
+                echo "$PAGE_RESPONSE" | grep 'promotion gate'
+                '''
+            }
+        }
+
+        stage('Verify Day 45 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day45-api-smoke'
+                echo "$LOGS" | grep 'day45-final-config'
+                echo "$LOGS" | grep 'day45-final-promotion'
+                '''
+            }
+        }
+
+        stage('Write Day 45 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    PROMOTION_PERFORMED=$(grep DAY45_PROMOTION_PERFORMED ../day45-promotion-result.env | cut -d '=' -f 2)
+
+                    FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-audit-config' http://127.0.0.1:3000/api/config")
+                    FINAL_PROMOTION=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day45-audit-promotion' http://127.0.0.1:3000/api/promotion-ready")
+
+                    if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_PRODLIKE_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="prodlike"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_STAGING_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="staging"
+                    fi
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 45",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "promoteToProdlike": "$PROMOTE_TO_PRODLIKE",
+  "forceStagingStabilityFailure": "$FORCE_STAGING_STABILITY_FAILURE",
+  "promotionPerformed": $PROMOTION_PERFORMED,
+  "expected": {
+    "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+    "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalDeployTarget": "$FINAL_DEPLOY_TARGET",
+    "gitCommit": "$EXPECTED_GIT_COMMIT",
+    "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT"
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "stagingBuilt": true,
+    "prodlikeBuilt": true,
+    "stagingMonitoringPassed": true,
+    "promotionGateEvaluated": true,
+    "promotionPerformed": $PROMOTION_PERFORMED,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 45 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+
+Promote to prodlike: $PROMOTE_TO_PRODLIKE
+Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE
+Promotion performed: $PROMOTION_PERFORMED
+
+Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final deploy target: $FINAL_DEPLOY_TARGET
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Final config response:
+$FINAL_CONFIG
+
+Final promotion response:
+$FINAL_PROMOTION
+EOF
+
+                    cp ../day45-staging-stability-checks.log "$AUDIT_DIR/day45-staging-stability-checks.log" 2>/dev/null || true
+
+                    grep "\\"day\\": \\"Day 45\\"" "$AUDIT_JSON"
+                    grep "\\"promotionGateEvaluated\\": true" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+                    grep "\\"releaseManifestMatchesRuntime\\": true" "$AUDIT_JSON"
+
+                    grep "Day 45 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "Promotion performed" "$AUDIT_TEXT"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 45 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day45-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day45-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day45-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 45 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Promote to prodlike: $PROMOTE_TO_PRODLIKE"
+                      echo "Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE"
+                      echo "Staging image tag: $EXPECTED_STAGING_IMAGE_TAG"
+                      echo "Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day45-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day45-running-release.json" \
+                      "$AUDIT_DIR/day45-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day45-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day45-evidence-summary.txt" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day45-running-release.json" \
+                      "$AUDIT_DIR/day45-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day45-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day45-evidence-summary.txt"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day45-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day45-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day45-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day45-running-release.json"
+
+                    sha256sum -c "$CHECKSUM_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 45 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day45-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 45 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "PROMOTE_TO_PRODLIKE=$PROMOTE_TO_PRODLIKE"
+                    echo "FORCE_STAGING_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                    echo "EXPECTED_STAGING_IMAGE_TAG=$EXPECTED_STAGING_IMAGE_TAG"
+                    echo "EXPECTED_PRODLIKE_IMAGE_TAG=$EXPECTED_PRODLIKE_IMAGE_TAG"
+
+                    ls -la "$AUDIT_DIR"
+
+                    docker ps -a --filter "name=day45_"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 45 pipeline completed successfully. Promotion gate behavior verified.'
+        }
+
+        failure {
+            echo 'Day 45 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 45 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 45 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 45 container list:"
+                docker ps -a --filter "name=day45_" || true
+
+                echo "Final Day 45 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 45 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 45 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 45 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
