@@ -421,6 +421,9 @@ README.md
     -u APPROVAL_STATUS \
     -u APPROVED_BY \
     -u APPROVAL_REASON \
+    -u DEPLOYMENT_WINDOW_STATUS \
+    -u CHANGE_FREEZE_ACTIVE \
+    -u FREEZE_REASON \
     node app.js > day48-missing-env.log 2>&1
                     EXIT_CODE=$?
                     set -e
