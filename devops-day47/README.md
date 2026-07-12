@@ -120,3 +120,12 @@ It should also have approval proof:
 Day 47 teaches the DevOps rule:
 
     A promoted release should have technical evidence and approval evidence.
+
+## Release Approval Gate
+
+Promotion from staging to prodlike requires:
+
+- Release notes to be generated.
+- `APPROVAL_STATUS=approved`.
+- A valid approver in `APPROVED_BY`.
+- An approval reason in `APPROVAL_REASON`.
