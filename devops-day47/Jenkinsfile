@@ -354,7 +354,7 @@ README.md
                     set -e
 
                     set +e
-                    env -u PORT \
+                   env -u PORT \
     -u APP_ENV \
     -u APP_VERSION \
     -u SERVICE_NAME \
@@ -365,6 +365,21 @@ README.md
     -u BUILD_NUMBER \
     -u GIT_COMMIT \
     -u IMAGE_TAG \
+    -u RELEASE_CREATED_AT \
+    -u ROLLBACK_IMAGE_TAG \
+    -u ROLLBACK_MODE \
+    -u STABILITY_CHECK_WINDOW_SECONDS \
+    -u STABILITY_CHECK_INTERVAL_SECONDS \
+    -u FORCE_STABILITY_FAILURE \
+    -u PROMOTION_TARGET \
+    -u PROMOTION_APPROVED \
+    -u CHANGE_RECORD_ID \
+    -u RELEASE_NOTES_REQUIRED \
+    -u RELEASE_NOTES_STATUS \
+    -u APPROVAL_REQUIRED \
+    -u APPROVAL_STATUS \
+    -u APPROVED_BY \
+    -u APPROVAL_REASON \
     node app.js > day47-missing-env.log 2>&1
                     EXIT_CODE=$?
                     set -e
