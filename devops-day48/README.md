@@ -145,3 +145,15 @@ It should also respect operational controls:
 Day 48 teaches the DevOps rule:
 
     A release can be healthy and approved, but still blocked if the deployment window is closed or a freeze is active.
+
+## Deployment Window
+
+Promotion to the prodlike environment is allowed only when:
+
+- `DEPLOYMENT_WINDOW_STATUS=open`
+- `CHANGE_FREEZE_ACTIVE=false`
+- Release notes are generated.
+- The deployment approval is approved.
+- A valid approver and approval reason are provided.
+
+When a change freeze is active, `FREEZE_REASON` must contain a meaningful reason.
