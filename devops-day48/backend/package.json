@@ -1,0 +1,13 @@
+{
+  "name": "day48-backend",
+  "version": "1.0.0",
+  "description": "Backend service for DevOps Day 48 deployment window freeze gate",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js",
+    "check": "node --check app.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}

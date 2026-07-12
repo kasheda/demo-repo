@@ -1,0 +1,1229 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'PROMOTE_TO_PRODLIKE',
+            choices: ['false', 'true'],
+            description: 'Promote Day 48 release to prodlike after all gates pass.'
+        )
+
+        choice(
+            name: 'FORCE_STAGING_STABILITY_FAILURE',
+            choices: ['false', 'true'],
+            description: 'Force staging stability failure to prove promotion is blocked.'
+        )
+
+        choice(
+            name: 'SKIP_RELEASE_NOTES',
+            choices: ['false', 'true'],
+            description: 'When true, release notes are not generated and promotion must be blocked.'
+        )
+
+        choice(
+            name: 'APPROVAL_STATUS',
+            choices: ['pending', 'approved'],
+            description: 'Approval status for Day 48 promotion.'
+        )
+
+        string(
+            name: 'APPROVED_BY',
+            defaultValue: 'release-manager',
+            description: 'Approver name used when APPROVAL_STATUS=approved.'
+        )
+
+        string(
+            name: 'APPROVAL_REASON',
+            defaultValue: 'staging validation passed',
+            description: 'Reason recorded in approval evidence.'
+        )
+
+        choice(
+            name: 'DEPLOYMENT_WINDOW_STATUS',
+            choices: ['open', 'closed'],
+            description: 'Deployment window status for promotion.'
+        )
+
+        choice(
+            name: 'CHANGE_FREEZE_ACTIVE',
+            choices: ['false', 'true'],
+            description: 'When true, promotion must be blocked.'
+        )
+
+        string(
+            name: 'FREEZE_REASON',
+            defaultValue: 'none',
+            description: 'Reason for freeze. Use none when no freeze is active.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 48'
+        PROJECT_DIR = 'devops-day48'
+        STAGING_ENV_FILE = '.env.staging.runtime'
+        PRODLIKE_ENV_FILE = '.env.prodlike.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day48_backend'
+        FRONTEND_CONTAINER = 'day48_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        RELEASE_NOTES_DIR = 'release-notes'
+        RELEASE_NOTES_MD = 'release-notes/day48-release-notes.md'
+        CHANGE_RECORD_JSON = 'release-notes/day48-change-record.json'
+        APPROVAL_RECORD_JSON = 'release-notes/day48-approval-record.json'
+        DEPLOYMENT_WINDOW_JSON = 'release-notes/day48-deployment-window-record.json'
+        AUDIT_JSON = 'deployment-audit/day48-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day48-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day48-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day48-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 48...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Day 48 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 48 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 48 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+release-notes/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 48 file: $file"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 48 file: $file"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 48 Runtime Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    CHANGE_RECORD_ID="DAY48-CHANGE-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    STAGING_IMAGE_TAG="day48-staging-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    PRODLIKE_IMAGE_TAG="day48-prodlike-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day48-staging-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                      RELEASE_NOTES_STATUS="draft"
+                    else
+                      RELEASE_NOTES_STATUS="generated"
+                    fi
+
+                    if [ "$APPROVAL_STATUS" = "approved" ]; then
+                      APPROVED_BY_VALUE="$APPROVED_BY"
+                      APPROVAL_REASON_VALUE=$(echo "$APPROVAL_REASON" | tr ' ' '-')
+                    else
+                      APPROVED_BY_VALUE="none"
+                      APPROVAL_REASON_VALUE="none"
+                    fi
+
+                    if [ "$CHANGE_FREEZE_ACTIVE" = "true" ] && [ "$FREEZE_REASON" = "none" ]; then
+                      echo "CHANGE_FREEZE_ACTIVE=true requires a non-none FREEZE_REASON."
+                      exit 1
+                    fi
+
+                    grep -v '^DAY48_BUILD_NUMBER=' .env.staging \
+                      | grep -v '^DAY48_GIT_COMMIT=' \
+                      | grep -v '^DAY48_IMAGE_TAG=' \
+                      | grep -v '^DAY48_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY48_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY48_ROLLBACK_MODE=' \
+                      | grep -v '^DAY48_FORCE_STABILITY_FAILURE=' \
+                      | grep -v '^DAY48_PROMOTION_APPROVED=' \
+                      | grep -v '^DAY48_CHANGE_RECORD_ID=' \
+                      | grep -v '^DAY48_RELEASE_NOTES_STATUS=' \
+                      | grep -v '^DAY48_APPROVAL_STATUS=' \
+                      | grep -v '^DAY48_APPROVED_BY=' \
+                      | grep -v '^DAY48_APPROVAL_REASON=' \
+                      | grep -v '^DAY48_DEPLOYMENT_WINDOW_STATUS=' \
+                      | grep -v '^DAY48_CHANGE_FREEZE_ACTIVE=' \
+                      | grep -v '^DAY48_FREEZE_REASON=' > "$STAGING_ENV_FILE"
+
+                    {
+                      echo "DAY48_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY48_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY48_IMAGE_TAG=$STAGING_IMAGE_TAG"
+                      echo "DAY48_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY48_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY48_ROLLBACK_MODE=normal"
+                      echo "DAY48_FORCE_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                      echo "DAY48_PROMOTION_APPROVED=$PROMOTE_TO_PRODLIKE"
+                      echo "DAY48_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                      echo "DAY48_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS"
+                      echo "DAY48_APPROVAL_STATUS=$APPROVAL_STATUS"
+                      echo "DAY48_APPROVED_BY=$APPROVED_BY_VALUE"
+                      echo "DAY48_APPROVAL_REASON=$APPROVAL_REASON_VALUE"
+                      echo "DAY48_DEPLOYMENT_WINDOW_STATUS=$DEPLOYMENT_WINDOW_STATUS"
+                      echo "DAY48_CHANGE_FREEZE_ACTIVE=$CHANGE_FREEZE_ACTIVE"
+                      echo "DAY48_FREEZE_REASON=$FREEZE_REASON"
+                    } >> "$STAGING_ENV_FILE"
+
+                    grep -v '^DAY48_BUILD_NUMBER=' .env.prodlike \
+                      | grep -v '^DAY48_GIT_COMMIT=' \
+                      | grep -v '^DAY48_IMAGE_TAG=' \
+                      | grep -v '^DAY48_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY48_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY48_ROLLBACK_MODE=' \
+                      | grep -v '^DAY48_CHANGE_RECORD_ID=' \
+                      | grep -v '^DAY48_RELEASE_NOTES_STATUS=' \
+                      | grep -v '^DAY48_APPROVAL_STATUS=' \
+                      | grep -v '^DAY48_APPROVED_BY=' \
+                      | grep -v '^DAY48_APPROVAL_REASON=' \
+                      | grep -v '^DAY48_DEPLOYMENT_WINDOW_STATUS=' \
+                      | grep -v '^DAY48_CHANGE_FREEZE_ACTIVE=' \
+                      | grep -v '^DAY48_FREEZE_REASON=' > "$PRODLIKE_ENV_FILE"
+
+                    {
+                      echo "DAY48_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY48_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY48_IMAGE_TAG=$PRODLIKE_IMAGE_TAG"
+                      echo "DAY48_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY48_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY48_ROLLBACK_MODE=normal"
+                      echo "DAY48_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                      echo "DAY48_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS"
+                      echo "DAY48_APPROVAL_STATUS=$APPROVAL_STATUS"
+                      echo "DAY48_APPROVED_BY=$APPROVED_BY_VALUE"
+                      echo "DAY48_APPROVAL_REASON=$APPROVAL_REASON_VALUE"
+                      echo "DAY48_DEPLOYMENT_WINDOW_STATUS=$DEPLOYMENT_WINDOW_STATUS"
+                      echo "DAY48_CHANGE_FREEZE_ACTIVE=$CHANGE_FREEZE_ACTIVE"
+                      echo "DAY48_FREEZE_REASON=$FREEZE_REASON"
+                    } >> "$PRODLIKE_ENV_FILE"
+
+                    grep -v '^DAY48_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY48_GIT_COMMIT=' \
+                      | grep -v '^DAY48_IMAGE_TAG=' \
+                      | grep -v '^DAY48_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY48_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY48_ROLLBACK_MODE=' \
+                      | grep -v '^DAY48_CHANGE_RECORD_ID=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY48_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY48_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY48_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY48_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY48_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY48_ROLLBACK_MODE=rollback"
+                      echo "DAY48_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "DAY48_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day48-build-metadata.env
+                    echo "DAY48_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_STAGING_IMAGE_TAG=$STAGING_IMAGE_TAG" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_PRODLIKE_IMAGE_TAG=$PRODLIKE_IMAGE_TAG" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_CHANGE_RECORD_ID=$CHANGE_RECORD_ID" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_APPROVAL_STATUS=$APPROVAL_STATUS" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_APPROVED_BY=$APPROVED_BY_VALUE" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_APPROVAL_REASON=$APPROVAL_REASON_VALUE" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_DEPLOYMENT_WINDOW_STATUS=$DEPLOYMENT_WINDOW_STATUS" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_CHANGE_FREEZE_ACTIVE=$CHANGE_FREEZE_ACTIVE" >> day48-build-metadata.env
+                    echo "DAY48_EXPECTED_FREEZE_REASON=$FREEZE_REASON" >> day48-build-metadata.env
+
+                    echo "Day 48 staging runtime env:"
+                    cat "$STAGING_ENV_FILE"
+
+                    echo "Day 48 prodlike runtime env:"
+                    cat "$PRODLIKE_ENV_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 48 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_STAGING_IMAGE_TAG = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_STAGING_IMAGE_TAG").trim()
+                        env.EXPECTED_PRODLIKE_IMAGE_TAG = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_PRODLIKE_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_RELEASE_CREATED_AT").trim()
+                        env.EXPECTED_CHANGE_RECORD_ID = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_CHANGE_RECORD_ID").trim()
+                        env.EXPECTED_RELEASE_NOTES_STATUS = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_RELEASE_NOTES_STATUS").trim()
+                        env.EXPECTED_APPROVAL_STATUS = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_APPROVAL_STATUS").trim()
+                        env.EXPECTED_APPROVED_BY = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_APPROVED_BY").trim()
+                        env.EXPECTED_APPROVAL_REASON = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_APPROVAL_REASON").trim()
+                        env.EXPECTED_DEPLOYMENT_WINDOW_STATUS = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_DEPLOYMENT_WINDOW_STATUS").trim()
+                        env.EXPECTED_CHANGE_FREEZE_ACTIVE = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_CHANGE_FREEZE_ACTIVE").trim()
+                        env.EXPECTED_FREEZE_REASON = sh(returnStdout: true, script: ". ./day48-build-metadata.env && echo \$DAY48_EXPECTED_FREEZE_REASON").trim()
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 48 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    node --check app.js
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 48 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DAY48_APP_ENV=day48-staging-env" .env.staging
+                    grep "DAY48_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY48_PROMOTION_TARGET=prodlike" .env.staging
+                    grep "DAY48_DEPLOYMENT_WINDOW_STATUS=closed" .env.staging
+
+                    grep "DAY48_APP_ENV=day48-prodlike-env" .env.prodlike
+                    grep "DAY48_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY48_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY48_DEPLOYMENT_WINDOW_STATUS=open" .env.prodlike
+
+                    grep "DAY48_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY48_CHANGE_FREEZE_ACTIVE=false" .env.rollback
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 48 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day48-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day48-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day48-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day48-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day48-env-example-keys.txt
+
+                    diff -u day48-env-example-keys.txt day48-env-keys.txt
+                    diff -u day48-env-example-keys.txt day48-staging-env-keys.txt
+                    diff -u day48-env-example-keys.txt day48-prodlike-env-keys.txt
+                    diff -u day48-env-example-keys.txt day48-rollback-env-keys.txt
+
+                    rm -f day48-env-keys.txt day48-staging-env-keys.txt day48-prodlike-env-keys.txt day48-rollback-env-keys.txt day48-env-example-keys.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 48 Deployment Window Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DEPLOYMENT_WINDOW_STATUS" backend/app.js
+                    grep "CHANGE_FREEZE_ACTIVE" backend/app.js
+                    grep "FREEZE_REASON" backend/app.js
+                    grep "app.get('/api/deployment-window'" backend/app.js
+                    grep "deploymentWindowReady" backend/app.js
+                    grep "DEPLOYMENT_WINDOW_STATUS" Jenkinsfile
+                    grep "CHANGE_FREEZE_ACTIVE" Jenkinsfile
+                    grep "Deployment Window" README.md
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 48 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    set +e
+                     env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    -u RELEASE_CREATED_AT \
+    -u ROLLBACK_IMAGE_TAG \
+    -u ROLLBACK_MODE \
+    -u STABILITY_CHECK_WINDOW_SECONDS \
+    -u STABILITY_CHECK_INTERVAL_SECONDS \
+    -u FORCE_STABILITY_FAILURE \
+    -u PROMOTION_TARGET \
+    -u PROMOTION_APPROVED \
+    -u CHANGE_RECORD_ID \
+    -u RELEASE_NOTES_REQUIRED \
+    -u RELEASE_NOTES_STATUS \
+    -u APPROVAL_REQUIRED \
+    -u APPROVAL_STATUS \
+    -u APPROVED_BY \
+    -u APPROVAL_REASON \
+    node app.js > day48-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day48-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 48 backend unexpectedly started without required environment variables."
+                      rm -f day48-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day48-missing-env.log
+                    grep "DEPLOYMENT_WINDOW_STATUS" day48-missing-env.log
+                    grep "CHANGE_FREEZE_ACTIVE" day48-missing-env.log
+
+                    rm -f day48-missing-env.log
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 48 Release Notes And Gate Records') {
+            when {
+                expression {
+                    return params.SKIP_RELEASE_NOTES == 'false'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$RELEASE_NOTES_DIR"
+
+                    cat > "$RELEASE_NOTES_MD" <<EOF
+# Day 48 Release Notes
+
+## Release Summary
+
+Day 48 adds a deployment window and change-freeze gate before prodlike promotion.
+
+## Build Metadata
+
+- Jenkins build number: $EXPECTED_BUILD_NUMBER
+- Git commit: $EXPECTED_GIT_COMMIT
+- Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+- Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+- Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+- Release created at: $EXPECTED_RELEASE_CREATED_AT
+- Change record ID: $EXPECTED_CHANGE_RECORD_ID
+
+## Approval Evidence
+
+- Approval status: $EXPECTED_APPROVAL_STATUS
+- Approved by: $EXPECTED_APPROVED_BY
+- Approval reason: $EXPECTED_APPROVAL_REASON
+
+## Deployment Window Evidence
+
+- Deployment window status: $EXPECTED_DEPLOYMENT_WINDOW_STATUS
+- Change freeze active: $EXPECTED_CHANGE_FREEZE_ACTIVE
+- Freeze reason: $EXPECTED_FREEZE_REASON
+
+## Promotion Decision Inputs
+
+- PROMOTE_TO_PRODLIKE: $PROMOTE_TO_PRODLIKE
+- FORCE_STAGING_STABILITY_FAILURE: $FORCE_STAGING_STABILITY_FAILURE
+- SKIP_RELEASE_NOTES: $SKIP_RELEASE_NOTES
+EOF
+
+                    cat > "$CHANGE_RECORD_JSON" <<EOF
+{
+  "day": "Day 48",
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "gitCommit": "$EXPECTED_GIT_COMMIT",
+  "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+  "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+  "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+  "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT",
+  "releaseNotesStatus": "generated",
+  "approvalStatus": "$EXPECTED_APPROVAL_STATUS",
+  "approvedBy": "$EXPECTED_APPROVED_BY",
+  "deploymentWindowStatus": "$EXPECTED_DEPLOYMENT_WINDOW_STATUS",
+  "changeFreezeActive": "$EXPECTED_CHANGE_FREEZE_ACTIVE",
+  "freezeReason": "$EXPECTED_FREEZE_REASON",
+  "promotionRequested": "$PROMOTE_TO_PRODLIKE",
+  "stagingFailureForced": "$FORCE_STAGING_STABILITY_FAILURE"
+}
+EOF
+
+                    cat > "$APPROVAL_RECORD_JSON" <<EOF
+{
+  "day": "Day 48",
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "approvalRequired": true,
+  "approvalStatus": "$EXPECTED_APPROVAL_STATUS",
+  "approvedBy": "$EXPECTED_APPROVED_BY",
+  "approvalReason": "$EXPECTED_APPROVAL_REASON",
+  "promotionRequested": "$PROMOTE_TO_PRODLIKE",
+  "gitCommit": "$EXPECTED_GIT_COMMIT",
+  "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+  "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG"
+}
+EOF
+
+                    cat > "$DEPLOYMENT_WINDOW_JSON" <<EOF
+{
+  "day": "Day 48",
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "deploymentWindowStatus": "$EXPECTED_DEPLOYMENT_WINDOW_STATUS",
+  "changeFreezeActive": "$EXPECTED_CHANGE_FREEZE_ACTIVE",
+  "freezeReason": "$EXPECTED_FREEZE_REASON",
+  "promotionRequested": "$PROMOTE_TO_PRODLIKE",
+  "gitCommit": "$EXPECTED_GIT_COMMIT",
+  "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+  "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG"
+}
+EOF
+
+                    grep "Day 48 Release Notes" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_CHANGE_RECORD_ID" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_DEPLOYMENT_WINDOW_STATUS" "$RELEASE_NOTES_MD"
+
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" "$CHANGE_RECORD_JSON"
+                    grep "\\"deploymentWindowStatus\\": \\"$EXPECTED_DEPLOYMENT_WINDOW_STATUS\\"" "$DEPLOYMENT_WINDOW_JSON"
+
+                    echo "Day 48 release notes and gate records generated."
+                    '''
+                }
+            }
+        }
+
+        stage('Block Day 48 If Release Notes Missing') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                      echo "SKIP_RELEASE_NOTES=true"
+                      echo "Release notes were intentionally skipped."
+
+                      if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                        echo "Promotion requested, but release notes are missing. Blocking promotion."
+                        exit 1
+                      fi
+
+                      echo "No promotion requested, so missing release notes are allowed for this staging-only run."
+                    else
+                      test -f "$RELEASE_NOTES_MD"
+                      test -f "$CHANGE_RECORD_JSON"
+                      test -f "$APPROVAL_RECORD_JSON"
+                      test -f "$DEPLOYMENT_WINDOW_JSON"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$RELEASE_NOTES_MD"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$DEPLOYMENT_WINDOW_JSON"
+                      echo "Release notes and gate evidence files exist."
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Block Day 48 Promotion If Approval Missing') {
+            steps {
+                sh '''
+                set -e
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ] && [ "$APPROVAL_STATUS" != "approved" ]; then
+                  echo "Promotion requested, but APPROVAL_STATUS is not approved."
+                  echo "Blocking Day 48 prodlike promotion."
+                  exit 1
+                fi
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ] && [ "$APPROVED_BY" = "none" ]; then
+                  echo "Promotion requested, but APPROVED_BY is none."
+                  echo "Blocking Day 48 prodlike promotion."
+                  exit 1
+                fi
+
+                echo "Day 48 approval gate passed or promotion was not requested."
+                '''
+            }
+        }
+
+        stage('Block Day 48 Promotion If Window Closed Or Frozen') {
+            steps {
+                sh '''
+                set -e
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ] && [ "$DEPLOYMENT_WINDOW_STATUS" != "open" ]; then
+                  echo "Promotion requested, but DEPLOYMENT_WINDOW_STATUS is not open."
+                  echo "Blocking Day 48 prodlike promotion."
+                  exit 1
+                fi
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ] && [ "$CHANGE_FREEZE_ACTIVE" = "true" ]; then
+                  echo "Promotion requested, but change freeze is active."
+                  echo "Freeze reason: $FREEZE_REASON"
+                  echo "Blocking Day 48 prodlike promotion."
+                  exit 1
+                fi
+
+                echo "Day 48 deployment window gate passed or promotion was not requested."
+                '''
+            }
+        }
+
+        stage('Build Day 48 Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" build --no-cache
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" build --no-cache
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker run --rm "day48-backend:$EXPECTED_STAGING_IMAGE_TAG" cat /app/release.json | tee day48-staging-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_STAGING_IMAGE_TAG\\"" day48-staging-release.json
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" day48-staging-release.json
+                    grep "\\"deploymentWindowStatus\\": \\"$EXPECTED_DEPLOYMENT_WINDOW_STATUS\\"" day48-staging-release.json
+
+                    docker run --rm "day48-backend:$EXPECTED_PRODLIKE_IMAGE_TAG" cat /app/release.json | tee day48-prodlike-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_PRODLIKE_IMAGE_TAG\\"" day48-prodlike-release.json
+                    grep "\\"deployTarget\\": \\"prodlike\\"" day48-prodlike-release.json
+                    grep "\\"changeFreezeActive\\": \\"$EXPECTED_CHANGE_FREEZE_ACTIVE\\"" day48-prodlike-release.json
+
+                    rm -f day48-staging-release.json day48-prodlike-release.json
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 48 Staging Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$STAGING_ENV_FILE" up -d
+
+                    docker ps --filter "name=day48_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 48 Staging Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Day 48 Staging Monitoring Gate') {
+            steps {
+                sh '''
+                set -e
+
+                MONITOR_RESULT_FILE="day48-staging-monitor-result.env"
+                STABILITY_LOG="day48-staging-stability-checks.log"
+
+                rm -f "$MONITOR_RESULT_FILE" "$STABILITY_LOG"
+
+                CHECK_NUMBER=1
+                TOTAL_CHECKS=3
+                MONITORING_FAILED=false
+
+                while [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; do
+                  echo "Day 48 staging stability check $CHECK_NUMBER of $TOTAL_CHECKS"
+
+                  set +e
+                  STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-staging-stability-gate-$CHECK_NUMBER' http://127.0.0.1:3000/api/stability")
+                  STABILITY_EXIT_CODE=$?
+                  set -e
+
+                  {
+                    echo "===== staging stability check $CHECK_NUMBER ====="
+                    echo "exitCode=$STABILITY_EXIT_CODE"
+                    echo "$STABILITY_RESPONSE"
+                  } >> "$STABILITY_LOG"
+
+                  if [ "$STABILITY_EXIT_CODE" -ne 0 ]; then
+                    MONITORING_FAILED=true
+                    break
+                  fi
+
+                  echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                  echo "$STABILITY_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                  CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+                  if [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; then
+                    sleep 5
+                  fi
+                done
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "DAY48_STAGING_MONITORING_RESULT=failed" > "$MONITOR_RESULT_FILE"
+                else
+                  echo "DAY48_STAGING_MONITORING_RESULT=passed" > "$MONITOR_RESULT_FILE"
+                fi
+
+                cat "$MONITOR_RESULT_FILE"
+                cat "$STABILITY_LOG"
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "Day 48 staging monitoring failed. Promotion must be blocked."
+                  exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('Verify Day 48 Gate Endpoints') {
+            steps {
+                sh '''
+                set -e
+
+                CHANGE_RECORD_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-change-record-smoke' http://127.0.0.1:3000/api/change-record")
+                APPROVAL_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-approval-record-smoke' http://127.0.0.1:3000/api/approval-record")
+                WINDOW_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-deployment-window-smoke' http://127.0.0.1:3000/api/deployment-window")
+                PROMOTION_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-promotion-ready-smoke' http://127.0.0.1:3000/api/promotion-ready")
+
+                echo "$CHANGE_RECORD_RESPONSE"
+                echo "$APPROVAL_RESPONSE"
+                echo "$WINDOW_RESPONSE"
+                echo "$PROMOTION_RESPONSE"
+
+                echo "$CHANGE_RECORD_RESPONSE" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+                echo "$CHANGE_RECORD_RESPONSE" | grep '"releaseNotesStatus":"generated"'
+                echo "$CHANGE_RECORD_RESPONSE" | grep '"changeRecordReady":true'
+
+                echo "$APPROVAL_RESPONSE" | grep "\\"approvalStatus\\":\\"$EXPECTED_APPROVAL_STATUS\\""
+                echo "$APPROVAL_RESPONSE" | grep "\\"approvedBy\\":\\"$EXPECTED_APPROVED_BY\\""
+
+                echo "$WINDOW_RESPONSE" | grep "\\"deploymentWindowStatus\\":\\"$EXPECTED_DEPLOYMENT_WINDOW_STATUS\\""
+                echo "$WINDOW_RESPONSE" | grep "\\"changeFreezeActive\\":$EXPECTED_CHANGE_FREEZE_ACTIVE"
+
+                echo "$PROMOTION_RESPONSE" | grep '"deployTarget":"staging"'
+                echo "$PROMOTION_RESPONSE" | grep '"promotionTarget":"prodlike"'
+                echo "$PROMOTION_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                  echo "$WINDOW_RESPONSE" | grep '"deploymentWindowReady":true'
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":true'
+                  echo "$PROMOTION_RESPONSE" | grep '"deploymentWindowReady":true'
+                else
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":false'
+                fi
+                '''
+            }
+        }
+
+        stage('Promote Day 48 To Prodlike') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'true'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Promoting Day 48 release to prodlike simulation..."
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" up -d
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "DAY48_PROMOTION_PERFORMED=true" > ../day48-promotion-result.env
+                    '''
+                }
+            }
+        }
+
+        stage('Record Day 48 No Promotion') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'false'
+                }
+            }
+            steps {
+                sh '''
+                set -e
+                echo "DAY48_PROMOTION_PERFORMED=false" > day48-promotion-result.env
+                cat day48-promotion-result.env
+                '''
+            }
+        }
+
+        stage('Verify Day 48 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                PROMOTION_PERFORMED=$(grep DAY48_PROMOTION_PERFORMED day48-promotion-result.env | cut -d '=' -f 2)
+
+                FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-final-config' http://127.0.0.1:3000/api/config")
+                FINAL_CHANGE_RECORD=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-final-change-record' http://127.0.0.1:3000/api/change-record")
+                FINAL_APPROVAL=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-final-approval-record' http://127.0.0.1:3000/api/approval-record")
+                FINAL_WINDOW=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-final-deployment-window' http://127.0.0.1:3000/api/deployment-window")
+                FINAL_STABILITY=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-final-stability' http://127.0.0.1:3000/api/stability")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "$FINAL_CONFIG"
+                echo "$FINAL_CHANGE_RECORD"
+                echo "$FINAL_APPROVAL"
+                echo "$FINAL_WINDOW"
+                echo "$FINAL_STABILITY"
+                echo "$FINAL_IMAGE"
+
+                if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                  echo "$FINAL_CONFIG" | grep '"environment":"day48-prodlike-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"prodlike"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_PRODLIKE_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day48-backend:$EXPECTED_PRODLIKE_IMAGE_TAG"
+                else
+                  echo "$FINAL_CONFIG" | grep '"environment":"day48-staging-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"staging"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_STAGING_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day48-backend:$EXPECTED_STAGING_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_CHANGE_RECORD" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+                echo "$FINAL_CHANGE_RECORD" | grep '"releaseNotesStatus":"generated"'
+                echo "$FINAL_APPROVAL" | grep "\\"approvalStatus\\":\\"$EXPECTED_APPROVAL_STATUS\\""
+                echo "$FINAL_APPROVAL" | grep "\\"approvedBy\\":\\"$EXPECTED_APPROVED_BY\\""
+                echo "$FINAL_WINDOW" | grep "\\"deploymentWindowStatus\\":\\"$EXPECTED_DEPLOYMENT_WINDOW_STATUS\\""
+                echo "$FINAL_STABILITY" | grep '"stable":true'
+                echo "$FINAL_STABILITY" | grep '"releaseManifestMatchesRuntime":true'
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 48 API Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-api-smoke' http://127.0.0.1:3000/api/message")
+                METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-metrics-smoke' http://127.0.0.1:3000/metrics")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$METRICS_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 48 backend API'
+                echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                echo "$METRICS_RESPONSE" | grep '"/api/deployment-window"'
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 48'
+                echo "$PAGE_RESPONSE" | grep 'deployment window and freeze gate'
+                '''
+            }
+        }
+
+        stage('Verify Day 48 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day48-api-smoke'
+                echo "$LOGS" | grep 'day48-final-config'
+                echo "$LOGS" | grep 'day48-final-deployment-window'
+                echo "$LOGS" | grep "$EXPECTED_CHANGE_RECORD_ID"
+                echo "$LOGS" | grep "$EXPECTED_DEPLOYMENT_WINDOW_STATUS"
+                '''
+            }
+        }
+
+        stage('Write Day 48 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    PROMOTION_PERFORMED=$(grep DAY48_PROMOTION_PERFORMED ../day48-promotion-result.env | cut -d '=' -f 2)
+
+                    FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-audit-config' http://127.0.0.1:3000/api/config")
+                    FINAL_CHANGE_RECORD=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-audit-change-record' http://127.0.0.1:3000/api/change-record")
+                    FINAL_APPROVAL=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-audit-approval-record' http://127.0.0.1:3000/api/approval-record")
+                    FINAL_WINDOW=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day48-audit-deployment-window' http://127.0.0.1:3000/api/deployment-window")
+
+                    if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_PRODLIKE_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="prodlike"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_STAGING_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="staging"
+                    fi
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 48",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "promoteToProdlike": "$PROMOTE_TO_PRODLIKE",
+  "forceStagingStabilityFailure": "$FORCE_STAGING_STABILITY_FAILURE",
+  "skipReleaseNotes": "$SKIP_RELEASE_NOTES",
+  "promotionPerformed": $PROMOTION_PERFORMED,
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "releaseNotesStatus": "$EXPECTED_RELEASE_NOTES_STATUS",
+  "approvalStatus": "$EXPECTED_APPROVAL_STATUS",
+  "approvedBy": "$EXPECTED_APPROVED_BY",
+  "approvalReason": "$EXPECTED_APPROVAL_REASON",
+  "deploymentWindowStatus": "$EXPECTED_DEPLOYMENT_WINDOW_STATUS",
+  "changeFreezeActive": "$EXPECTED_CHANGE_FREEZE_ACTIVE",
+  "freezeReason": "$EXPECTED_FREEZE_REASON",
+  "releaseNotesFile": "$RELEASE_NOTES_MD",
+  "changeRecordFile": "$CHANGE_RECORD_JSON",
+  "approvalRecordFile": "$APPROVAL_RECORD_JSON",
+  "deploymentWindowFile": "$DEPLOYMENT_WINDOW_JSON",
+  "expected": {
+    "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+    "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalDeployTarget": "$FINAL_DEPLOY_TARGET",
+    "gitCommit": "$EXPECTED_GIT_COMMIT",
+    "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT"
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "releaseNotesGenerated": true,
+    "changeRecordGenerated": true,
+    "approvalRecordGenerated": true,
+    "deploymentWindowRecordGenerated": true,
+    "approvalGateEvaluated": true,
+    "deploymentWindowGateEvaluated": true,
+    "stagingBuilt": true,
+    "prodlikeBuilt": true,
+    "stagingMonitoringPassed": true,
+    "promotionGateEvaluated": true,
+    "promotionPerformed": $PROMOTION_PERFORMED,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 48 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+
+Promote to prodlike: $PROMOTE_TO_PRODLIKE
+Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE
+Skip release notes: $SKIP_RELEASE_NOTES
+Promotion performed: $PROMOTION_PERFORMED
+
+Change record ID: $EXPECTED_CHANGE_RECORD_ID
+Release notes status: $EXPECTED_RELEASE_NOTES_STATUS
+Approval status: $EXPECTED_APPROVAL_STATUS
+Approved by: $EXPECTED_APPROVED_BY
+Approval reason: $EXPECTED_APPROVAL_REASON
+Deployment window status: $EXPECTED_DEPLOYMENT_WINDOW_STATUS
+Change freeze active: $EXPECTED_CHANGE_FREEZE_ACTIVE
+Freeze reason: $EXPECTED_FREEZE_REASON
+
+Release notes file: $RELEASE_NOTES_MD
+Change record file: $CHANGE_RECORD_JSON
+Approval record file: $APPROVAL_RECORD_JSON
+Deployment window file: $DEPLOYMENT_WINDOW_JSON
+
+Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final deploy target: $FINAL_DEPLOY_TARGET
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Final config response:
+$FINAL_CONFIG
+
+Final change record response:
+$FINAL_CHANGE_RECORD
+
+Final approval response:
+$FINAL_APPROVAL
+
+Final deployment window response:
+$FINAL_WINDOW
+EOF
+
+                    cp ../day48-staging-stability-checks.log "$AUDIT_DIR/day48-staging-stability-checks.log" 2>/dev/null || true
+
+                    grep "\\"day\\": \\"Day 48\\"" "$AUDIT_JSON"
+                    grep "\\"deploymentWindowRecordGenerated\\": true" "$AUDIT_JSON"
+                    grep "\\"deploymentWindowGateEvaluated\\": true" "$AUDIT_JSON"
+                    grep "\\"deploymentWindowStatus\\": \\"$EXPECTED_DEPLOYMENT_WINDOW_STATUS\\"" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+                    grep "\\"releaseManifestMatchesRuntime\\": true" "$AUDIT_JSON"
+
+                    grep "Day 48 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "$EXPECTED_CHANGE_RECORD_ID" "$AUDIT_TEXT"
+                    grep "$EXPECTED_DEPLOYMENT_WINDOW_STATUS" "$AUDIT_TEXT"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 48 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day48-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day48-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day48-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 48 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Promote to prodlike: $PROMOTE_TO_PRODLIKE"
+                      echo "Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE"
+                      echo "Skip release notes: $SKIP_RELEASE_NOTES"
+                      echo "Change record ID: $EXPECTED_CHANGE_RECORD_ID"
+                      echo "Approval status: $EXPECTED_APPROVAL_STATUS"
+                      echo "Approved by: $EXPECTED_APPROVED_BY"
+                      echo "Deployment window status: $EXPECTED_DEPLOYMENT_WINDOW_STATUS"
+                      echo "Change freeze active: $EXPECTED_CHANGE_FREEZE_ACTIVE"
+                      echo "Freeze reason: $EXPECTED_FREEZE_REASON"
+                      echo "Staging image tag: $EXPECTED_STAGING_IMAGE_TAG"
+                      echo "Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" "$RELEASE_NOTES_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day48-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day48-running-release.json" \
+                      "$AUDIT_DIR/day48-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day48-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day48-evidence-summary.txt" \
+                      "$RELEASE_NOTES_MD" \
+                      "$CHANGE_RECORD_JSON" \
+                      "$APPROVAL_RECORD_JSON" \
+                      "$DEPLOYMENT_WINDOW_JSON" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day48-running-release.json" \
+                      "$AUDIT_DIR/day48-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day48-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day48-evidence-summary.txt" \
+                      "$RELEASE_NOTES_MD" \
+                      "$CHANGE_RECORD_JSON" \
+                      "$APPROVAL_RECORD_JSON" \
+                      "$DEPLOYMENT_WINDOW_JSON"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-release-notes.md"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-change-record.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-approval-record.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day48-deployment-window-record.json"
+
+                    sha256sum -c "$CHECKSUM_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 48 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day48-*,release-notes/day48-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 48 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "PROMOTE_TO_PRODLIKE=$PROMOTE_TO_PRODLIKE"
+                    echo "FORCE_STAGING_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                    echo "SKIP_RELEASE_NOTES=$SKIP_RELEASE_NOTES"
+                    echo "APPROVAL_STATUS=$APPROVAL_STATUS"
+                    echo "APPROVED_BY=$APPROVED_BY"
+                    echo "DEPLOYMENT_WINDOW_STATUS=$DEPLOYMENT_WINDOW_STATUS"
+                    echo "CHANGE_FREEZE_ACTIVE=$CHANGE_FREEZE_ACTIVE"
+                    echo "FREEZE_REASON=$FREEZE_REASON"
+                    echo "EXPECTED_CHANGE_RECORD_ID=$EXPECTED_CHANGE_RECORD_ID"
+
+                    ls -la "$AUDIT_DIR"
+                    ls -la "$RELEASE_NOTES_DIR"
+
+                    docker ps -a --filter "name=day48_"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 48 pipeline completed successfully. Deployment window and freeze gate verified.'
+        }
+
+        failure {
+            echo 'Day 48 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 48 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 48 release notes files:"
+                ls -la "$RELEASE_NOTES_DIR" || true
+
+                echo "Final Day 48 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 48 container list:"
+                docker ps -a --filter "name=day48_" || true
+
+                echo "Final Day 48 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 48 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 48 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 48 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
