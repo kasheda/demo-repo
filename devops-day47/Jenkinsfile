@@ -1,0 +1,1099 @@
+pipeline {
+    agent any
+
+    parameters {
+        choice(
+            name: 'PROMOTE_TO_PRODLIKE',
+            choices: ['false', 'true'],
+            description: 'Promote Day 47 release to prodlike after staging validation, release notes, and approval pass.'
+        )
+
+        choice(
+            name: 'FORCE_STAGING_STABILITY_FAILURE',
+            choices: ['false', 'true'],
+            description: 'Force staging stability failure to prove promotion is blocked.'
+        )
+
+        choice(
+            name: 'SKIP_RELEASE_NOTES',
+            choices: ['false', 'true'],
+            description: 'When true, release notes are not generated and promotion must be blocked.'
+        )
+
+        choice(
+            name: 'APPROVAL_STATUS',
+            choices: ['pending', 'approved'],
+            description: 'Approval status for Day 47 promotion.'
+        )
+
+        string(
+            name: 'APPROVED_BY',
+            defaultValue: 'release-manager',
+            description: 'Approver name used when APPROVAL_STATUS=approved.'
+        )
+
+        string(
+            name: 'APPROVAL_REASON',
+            defaultValue: 'staging validation passed',
+            description: 'Reason recorded in approval evidence.'
+        )
+    }
+
+    environment {
+        DAY_NAME = 'Day 47'
+        PROJECT_DIR = 'devops-day47'
+        STAGING_ENV_FILE = '.env.staging.runtime'
+        PRODLIKE_ENV_FILE = '.env.prodlike.runtime'
+        ROLLBACK_ENV_FILE = '.env.rollback.runtime'
+        BACKEND_CONTAINER = 'day47_backend'
+        FRONTEND_CONTAINER = 'day47_frontend'
+        AUDIT_DIR = 'deployment-audit'
+        RELEASE_NOTES_DIR = 'release-notes'
+        RELEASE_NOTES_MD = 'release-notes/day47-release-notes.md'
+        CHANGE_RECORD_JSON = 'release-notes/day47-change-record.json'
+        APPROVAL_RECORD_JSON = 'release-notes/day47-approval-record.json'
+        AUDIT_JSON = 'deployment-audit/day47-deployment-audit.json'
+        AUDIT_TEXT = 'deployment-audit/day47-deployment-audit.txt'
+        CHECKSUM_FILE = 'deployment-audit/day47-evidence-checksums.txt'
+        EVIDENCE_BUNDLE = 'deployment-audit/day47-evidence-bundle.tar.gz'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                echo 'Checking out source code for Day 47...'
+                checkout scm
+            }
+        }
+
+        stage('Validate Day 47 Jenkins Runtime') {
+            steps {
+                sh '''
+                set -e
+
+                git --version
+                node --version
+                npm --version
+                docker --version
+                docker compose version
+                sha256sum --version | head -1
+                tar --version | head -1
+
+                echo "Day 47 Jenkins runtime has required tools."
+                '''
+            }
+        }
+
+        stage('Validate Day 47 Project Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    REQUIRED_FILES="
+backend/app.js
+backend/package.json
+backend/Dockerfile
+backend/.dockerignore
+frontend/index.html
+frontend/nginx.conf
+frontend/Dockerfile
+frontend/.dockerignore
+deployment-audit/.gitkeep
+release-notes/.gitkeep
+.env
+.env.staging
+.env.prodlike
+.env.rollback
+.env.example
+docker-compose.yml
+Jenkinsfile
+README.md
+"
+
+                    for file in $REQUIRED_FILES; do
+                      if [ ! -f "$file" ]; then
+                        echo "Missing required Day 47 file: $file"
+                        find . -maxdepth 3 -type f | sort
+                        exit 1
+                      fi
+
+                      echo "Found Day 47 file: $file"
+                    done
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 47 Runtime Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    GIT_COMMIT_SHORT=$(git rev-parse --short HEAD)
+                    BUILD_NUMBER_VALUE="${BUILD_NUMBER:-local}"
+                    RELEASE_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    CHANGE_RECORD_ID="DAY47-CHANGE-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    STAGING_IMAGE_TAG="day47-staging-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    PRODLIKE_IMAGE_TAG="day47-prodlike-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+                    ROLLBACK_IMAGE_TAG="day47-staging-rollback-${BUILD_NUMBER_VALUE}-${GIT_COMMIT_SHORT}"
+
+                    if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                      RELEASE_NOTES_STATUS="draft"
+                    else
+                      RELEASE_NOTES_STATUS="generated"
+                    fi
+
+                    if [ "$APPROVAL_STATUS" = "approved" ]; then
+                      APPROVED_BY_VALUE="$APPROVED_BY"
+                      APPROVAL_REASON_VALUE=$(echo "$APPROVAL_REASON" | tr ' ' '-')
+                    else
+                      APPROVED_BY_VALUE="none"
+                      APPROVAL_REASON_VALUE="none"
+                    fi
+
+                    grep -v '^DAY47_BUILD_NUMBER=' .env.staging \
+                      | grep -v '^DAY47_GIT_COMMIT=' \
+                      | grep -v '^DAY47_IMAGE_TAG=' \
+                      | grep -v '^DAY47_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY47_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY47_ROLLBACK_MODE=' \
+                      | grep -v '^DAY47_FORCE_STABILITY_FAILURE=' \
+                      | grep -v '^DAY47_PROMOTION_APPROVED=' \
+                      | grep -v '^DAY47_CHANGE_RECORD_ID=' \
+                      | grep -v '^DAY47_RELEASE_NOTES_STATUS=' \
+                      | grep -v '^DAY47_APPROVAL_STATUS=' \
+                      | grep -v '^DAY47_APPROVED_BY=' \
+                      | grep -v '^DAY47_APPROVAL_REASON=' > "$STAGING_ENV_FILE"
+
+                    {
+                      echo "DAY47_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY47_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY47_IMAGE_TAG=$STAGING_IMAGE_TAG"
+                      echo "DAY47_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY47_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY47_ROLLBACK_MODE=normal"
+                      echo "DAY47_FORCE_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                      echo "DAY47_PROMOTION_APPROVED=$PROMOTE_TO_PRODLIKE"
+                      echo "DAY47_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                      echo "DAY47_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS"
+                      echo "DAY47_APPROVAL_STATUS=$APPROVAL_STATUS"
+                      echo "DAY47_APPROVED_BY=$APPROVED_BY_VALUE"
+                      echo "DAY47_APPROVAL_REASON=$APPROVAL_REASON_VALUE"
+                    } >> "$STAGING_ENV_FILE"
+
+                    grep -v '^DAY47_BUILD_NUMBER=' .env.prodlike \
+                      | grep -v '^DAY47_GIT_COMMIT=' \
+                      | grep -v '^DAY47_IMAGE_TAG=' \
+                      | grep -v '^DAY47_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY47_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY47_ROLLBACK_MODE=' \
+                      | grep -v '^DAY47_CHANGE_RECORD_ID=' \
+                      | grep -v '^DAY47_RELEASE_NOTES_STATUS=' \
+                      | grep -v '^DAY47_APPROVAL_STATUS=' \
+                      | grep -v '^DAY47_APPROVED_BY=' \
+                      | grep -v '^DAY47_APPROVAL_REASON=' > "$PRODLIKE_ENV_FILE"
+
+                    {
+                      echo "DAY47_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY47_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY47_IMAGE_TAG=$PRODLIKE_IMAGE_TAG"
+                      echo "DAY47_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY47_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY47_ROLLBACK_MODE=normal"
+                      echo "DAY47_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                      echo "DAY47_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS"
+                      echo "DAY47_APPROVAL_STATUS=$APPROVAL_STATUS"
+                      echo "DAY47_APPROVED_BY=$APPROVED_BY_VALUE"
+                      echo "DAY47_APPROVAL_REASON=$APPROVAL_REASON_VALUE"
+                    } >> "$PRODLIKE_ENV_FILE"
+
+                    grep -v '^DAY47_BUILD_NUMBER=' .env.rollback \
+                      | grep -v '^DAY47_GIT_COMMIT=' \
+                      | grep -v '^DAY47_IMAGE_TAG=' \
+                      | grep -v '^DAY47_RELEASE_CREATED_AT=' \
+                      | grep -v '^DAY47_ROLLBACK_IMAGE_TAG=' \
+                      | grep -v '^DAY47_ROLLBACK_MODE=' \
+                      | grep -v '^DAY47_CHANGE_RECORD_ID=' > "$ROLLBACK_ENV_FILE"
+
+                    {
+                      echo "DAY47_BUILD_NUMBER=$BUILD_NUMBER_VALUE"
+                      echo "DAY47_GIT_COMMIT=$GIT_COMMIT_SHORT"
+                      echo "DAY47_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY47_RELEASE_CREATED_AT=$RELEASE_CREATED_AT"
+                      echo "DAY47_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG"
+                      echo "DAY47_ROLLBACK_MODE=rollback"
+                      echo "DAY47_CHANGE_RECORD_ID=$CHANGE_RECORD_ID"
+                    } >> "$ROLLBACK_ENV_FILE"
+
+                    echo "DAY47_EXPECTED_BUILD_NUMBER=$BUILD_NUMBER_VALUE" > day47-build-metadata.env
+                    echo "DAY47_EXPECTED_GIT_COMMIT=$GIT_COMMIT_SHORT" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_STAGING_IMAGE_TAG=$STAGING_IMAGE_TAG" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_PRODLIKE_IMAGE_TAG=$PRODLIKE_IMAGE_TAG" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_ROLLBACK_IMAGE_TAG=$ROLLBACK_IMAGE_TAG" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_RELEASE_CREATED_AT=$RELEASE_CREATED_AT" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_CHANGE_RECORD_ID=$CHANGE_RECORD_ID" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_RELEASE_NOTES_STATUS=$RELEASE_NOTES_STATUS" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_APPROVAL_STATUS=$APPROVAL_STATUS" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_APPROVED_BY=$APPROVED_BY_VALUE" >> day47-build-metadata.env
+                    echo "DAY47_EXPECTED_APPROVAL_REASON=$APPROVAL_REASON_VALUE" >> day47-build-metadata.env
+
+                    echo "Day 47 staging runtime env:"
+                    cat "$STAGING_ENV_FILE"
+
+                    echo "Day 47 prodlike runtime env:"
+                    cat "$PRODLIKE_ENV_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Load Day 47 Build Metadata') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    script {
+                        env.EXPECTED_BUILD_NUMBER = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_BUILD_NUMBER").trim()
+                        env.EXPECTED_GIT_COMMIT = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_GIT_COMMIT").trim()
+                        env.EXPECTED_STAGING_IMAGE_TAG = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_STAGING_IMAGE_TAG").trim()
+                        env.EXPECTED_PRODLIKE_IMAGE_TAG = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_PRODLIKE_IMAGE_TAG").trim()
+                        env.EXPECTED_ROLLBACK_IMAGE_TAG = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_ROLLBACK_IMAGE_TAG").trim()
+                        env.EXPECTED_RELEASE_CREATED_AT = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_RELEASE_CREATED_AT").trim()
+                        env.EXPECTED_CHANGE_RECORD_ID = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_CHANGE_RECORD_ID").trim()
+                        env.EXPECTED_RELEASE_NOTES_STATUS = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_RELEASE_NOTES_STATUS").trim()
+                        env.EXPECTED_APPROVAL_STATUS = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_APPROVAL_STATUS").trim()
+                        env.EXPECTED_APPROVED_BY = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_APPROVED_BY").trim()
+                        env.EXPECTED_APPROVAL_REASON = sh(returnStdout: true, script: ". ./day47-build-metadata.env && echo \$DAY47_EXPECTED_APPROVAL_REASON").trim()
+                    }
+                }
+            }
+        }
+
+        stage('Validate Day 47 Backend Syntax') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+                    node --check app.js
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 47 Env Files') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "DAY47_APP_ENV=day47-staging-env" .env.staging
+                    grep "DAY47_DEPLOY_TARGET=staging" .env.staging
+                    grep "DAY47_PROMOTION_TARGET=prodlike" .env.staging
+                    grep "DAY47_APPROVAL_REQUIRED=true" .env.staging
+                    grep "DAY47_APPROVAL_STATUS=pending" .env.staging
+
+                    grep "DAY47_APP_ENV=day47-prodlike-env" .env.prodlike
+                    grep "DAY47_DEPLOY_TARGET=prodlike" .env.prodlike
+                    grep "DAY47_FEATURE_FLAG=disabled" .env.prodlike
+                    grep "DAY47_APPROVAL_STATUS=approved" .env.prodlike
+
+                    grep "DAY47_ROLLBACK_MODE=rollback" .env.rollback
+                    grep "DAY47_APPROVAL_REQUIRED=false" .env.rollback
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 47 Env Key Drift') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    cut -d '=' -f 1 .env | grep -v '^$' | sort > day47-env-keys.txt
+                    cut -d '=' -f 1 .env.staging | grep -v '^$' | sort > day47-staging-env-keys.txt
+                    cut -d '=' -f 1 .env.prodlike | grep -v '^$' | sort > day47-prodlike-env-keys.txt
+                    cut -d '=' -f 1 .env.rollback | grep -v '^$' | sort > day47-rollback-env-keys.txt
+                    cut -d '=' -f 1 .env.example | grep -v '^$' | sort > day47-env-example-keys.txt
+
+                    diff -u day47-env-example-keys.txt day47-env-keys.txt
+                    diff -u day47-env-example-keys.txt day47-staging-env-keys.txt
+                    diff -u day47-env-example-keys.txt day47-prodlike-env-keys.txt
+                    diff -u day47-env-example-keys.txt day47-rollback-env-keys.txt
+
+                    rm -f day47-env-keys.txt day47-staging-env-keys.txt day47-prodlike-env-keys.txt day47-rollback-env-keys.txt day47-env-example-keys.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 47 Approval Code') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    grep "APPROVAL_REQUIRED" backend/app.js
+                    grep "APPROVAL_STATUS" backend/app.js
+                    grep "APPROVED_BY" backend/app.js
+                    grep "APPROVAL_REASON" backend/app.js
+                    grep "app.get('/api/approval-record'" backend/app.js
+                    grep "approvalRecordReady" backend/app.js
+                    grep "APPROVAL_STATUS" Jenkinsfile
+                    grep "Release Approval Gate" README.md
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Day 47 App Fails Without Required Env') {
+            steps {
+                dir("${PROJECT_DIR}/backend") {
+                    sh '''
+                    set -e
+
+                    set +e
+                    env -u PORT \
+    -u APP_ENV \
+    -u APP_VERSION \
+    -u SERVICE_NAME \
+    -u FEATURE_FLAG \
+    -u LOG_LEVEL \
+    -u METRICS_ENABLED \
+    -u DEPLOY_TARGET \
+    -u BUILD_NUMBER \
+    -u GIT_COMMIT \
+    -u IMAGE_TAG \
+    node app.js > day47-missing-env.log 2>&1
+                    EXIT_CODE=$?
+                    set -e
+
+                    cat day47-missing-env.log
+
+                    if [ "$EXIT_CODE" -eq 0 ]; then
+                      echo "Day 47 backend unexpectedly started without required environment variables."
+                      rm -f day47-missing-env.log
+                      exit 1
+                    fi
+
+                    grep "Missing required environment variables" day47-missing-env.log
+                    grep "APPROVAL_REQUIRED" day47-missing-env.log
+                    grep "APPROVAL_STATUS" day47-missing-env.log
+
+                    rm -f day47-missing-env.log
+                    '''
+                }
+            }
+        }
+
+        stage('Generate Day 47 Release Notes And Approval Record') {
+            when {
+                expression {
+                    return params.SKIP_RELEASE_NOTES == 'false'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$RELEASE_NOTES_DIR"
+
+                    cat > "$RELEASE_NOTES_MD" <<EOF
+# Day 47 Release Notes
+
+## Release Summary
+
+Day 47 adds a release approval gate before prodlike promotion.
+
+## Build Metadata
+
+- Jenkins build number: $EXPECTED_BUILD_NUMBER
+- Git commit: $EXPECTED_GIT_COMMIT
+- Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+- Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+- Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+- Release created at: $EXPECTED_RELEASE_CREATED_AT
+- Change record ID: $EXPECTED_CHANGE_RECORD_ID
+
+## Approval Evidence
+
+- Approval status: $EXPECTED_APPROVAL_STATUS
+- Approved by: $EXPECTED_APPROVED_BY
+- Approval reason: $EXPECTED_APPROVAL_REASON
+
+## Promotion Decision Inputs
+
+- PROMOTE_TO_PRODLIKE: $PROMOTE_TO_PRODLIKE
+- FORCE_STAGING_STABILITY_FAILURE: $FORCE_STAGING_STABILITY_FAILURE
+- SKIP_RELEASE_NOTES: $SKIP_RELEASE_NOTES
+EOF
+
+                    cat > "$CHANGE_RECORD_JSON" <<EOF
+{
+  "day": "Day 47",
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "gitCommit": "$EXPECTED_GIT_COMMIT",
+  "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+  "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+  "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+  "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT",
+  "releaseNotesStatus": "generated",
+  "approvalStatus": "$EXPECTED_APPROVAL_STATUS",
+  "approvedBy": "$EXPECTED_APPROVED_BY",
+  "approvalReason": "$EXPECTED_APPROVAL_REASON",
+  "promotionRequested": "$PROMOTE_TO_PRODLIKE",
+  "stagingFailureForced": "$FORCE_STAGING_STABILITY_FAILURE"
+}
+EOF
+
+                    cat > "$APPROVAL_RECORD_JSON" <<EOF
+{
+  "day": "Day 47",
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "approvalRequired": true,
+  "approvalStatus": "$EXPECTED_APPROVAL_STATUS",
+  "approvedBy": "$EXPECTED_APPROVED_BY",
+  "approvalReason": "$EXPECTED_APPROVAL_REASON",
+  "promotionRequested": "$PROMOTE_TO_PRODLIKE",
+  "gitCommit": "$EXPECTED_GIT_COMMIT",
+  "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+  "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG"
+}
+EOF
+
+                    grep "Day 47 Release Notes" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_CHANGE_RECORD_ID" "$RELEASE_NOTES_MD"
+                    grep "$EXPECTED_APPROVAL_STATUS" "$RELEASE_NOTES_MD"
+
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" "$CHANGE_RECORD_JSON"
+                    grep "\\"approvalStatus\\": \\"$EXPECTED_APPROVAL_STATUS\\"" "$APPROVAL_RECORD_JSON"
+
+                    echo "Day 47 release notes, change record, and approval record generated."
+                    '''
+                }
+            }
+        }
+
+        stage('Block Day 47 If Release Notes Missing') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    if [ "$SKIP_RELEASE_NOTES" = "true" ]; then
+                      echo "SKIP_RELEASE_NOTES=true"
+                      echo "Release notes were intentionally skipped."
+
+                      if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                        echo "Promotion requested, but release notes are missing. Blocking promotion."
+                        exit 1
+                      fi
+
+                      echo "No promotion requested, so missing release notes are allowed for this staging-only run."
+                    else
+                      test -f "$RELEASE_NOTES_MD"
+                      test -f "$CHANGE_RECORD_JSON"
+                      test -f "$APPROVAL_RECORD_JSON"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$RELEASE_NOTES_MD"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$CHANGE_RECORD_JSON"
+                      grep "$EXPECTED_CHANGE_RECORD_ID" "$APPROVAL_RECORD_JSON"
+                      echo "Release notes and approval evidence files exist."
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Block Day 47 Promotion If Approval Missing') {
+            steps {
+                sh '''
+                set -e
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ] && [ "$APPROVAL_STATUS" != "approved" ]; then
+                  echo "Promotion requested, but APPROVAL_STATUS is not approved."
+                  echo "Blocking Day 47 prodlike promotion."
+                  exit 1
+                fi
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ] && [ "$APPROVED_BY" = "none" ]; then
+                  echo "Promotion requested, but APPROVED_BY is none."
+                  echo "Blocking Day 47 prodlike promotion."
+                  exit 1
+                fi
+
+                echo "Day 47 approval gate passed or promotion was not requested."
+                '''
+            }
+        }
+
+        stage('Build Day 47 Images') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" build --no-cache
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" build --no-cache
+                    docker compose --env-file "$ROLLBACK_ENV_FILE" build --no-cache
+
+                    docker run --rm "day47-backend:$EXPECTED_STAGING_IMAGE_TAG" cat /app/release.json | tee day47-staging-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_STAGING_IMAGE_TAG\\"" day47-staging-release.json
+                    grep "\\"changeRecordId\\": \\"$EXPECTED_CHANGE_RECORD_ID\\"" day47-staging-release.json
+                    grep "\\"approvalStatus\\": \\"$EXPECTED_APPROVAL_STATUS\\"" day47-staging-release.json
+
+                    docker run --rm "day47-backend:$EXPECTED_PRODLIKE_IMAGE_TAG" cat /app/release.json | tee day47-prodlike-release.json
+                    grep "\\"imageTag\\": \\"$EXPECTED_PRODLIKE_IMAGE_TAG\\"" day47-prodlike-release.json
+                    grep "\\"deployTarget\\": \\"prodlike\\"" day47-prodlike-release.json
+                    grep "\\"approvedBy\\": \\"$EXPECTED_APPROVED_BY\\"" day47-prodlike-release.json
+
+                    rm -f day47-staging-release.json day47-prodlike-release.json
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy Day 47 Staging Candidate') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$STAGING_ENV_FILE" up -d
+
+                    docker ps --filter "name=day47_"
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Day 47 Staging Health') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Day 47 Staging Monitoring Gate') {
+            steps {
+                sh '''
+                set -e
+
+                MONITOR_RESULT_FILE="day47-staging-monitor-result.env"
+                STABILITY_LOG="day47-staging-stability-checks.log"
+
+                rm -f "$MONITOR_RESULT_FILE" "$STABILITY_LOG"
+
+                CHECK_NUMBER=1
+                TOTAL_CHECKS=3
+                MONITORING_FAILED=false
+
+                while [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; do
+                  echo "Day 47 staging stability check $CHECK_NUMBER of $TOTAL_CHECKS"
+
+                  set +e
+                  STABILITY_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-staging-stability-gate-$CHECK_NUMBER' http://127.0.0.1:3000/api/stability")
+                  STABILITY_EXIT_CODE=$?
+                  set -e
+
+                  {
+                    echo "===== staging stability check $CHECK_NUMBER ====="
+                    echo "exitCode=$STABILITY_EXIT_CODE"
+                    echo "$STABILITY_RESPONSE"
+                  } >> "$STABILITY_LOG"
+
+                  if [ "$STABILITY_EXIT_CODE" -ne 0 ]; then
+                    MONITORING_FAILED=true
+                    break
+                  fi
+
+                  echo "$STABILITY_RESPONSE" | grep '"stable":true'
+                  echo "$STABILITY_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                  CHECK_NUMBER=$((CHECK_NUMBER + 1))
+
+                  if [ "$CHECK_NUMBER" -le "$TOTAL_CHECKS" ]; then
+                    sleep 5
+                  fi
+                done
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "DAY47_STAGING_MONITORING_RESULT=failed" > "$MONITOR_RESULT_FILE"
+                else
+                  echo "DAY47_STAGING_MONITORING_RESULT=passed" > "$MONITOR_RESULT_FILE"
+                fi
+
+                cat "$MONITOR_RESULT_FILE"
+                cat "$STABILITY_LOG"
+
+                if [ "$MONITORING_FAILED" = "true" ]; then
+                  echo "Day 47 staging monitoring failed. Promotion must be blocked."
+                  exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('Verify Day 47 Approval And Promotion Readiness') {
+            steps {
+                sh '''
+                set -e
+
+                CHANGE_RECORD_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-change-record-smoke' http://127.0.0.1:3000/api/change-record")
+                APPROVAL_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-approval-record-smoke' http://127.0.0.1:3000/api/approval-record")
+                PROMOTION_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-promotion-ready-smoke' http://127.0.0.1:3000/api/promotion-ready")
+
+                echo "$CHANGE_RECORD_RESPONSE"
+                echo "$APPROVAL_RESPONSE"
+                echo "$PROMOTION_RESPONSE"
+
+                echo "$CHANGE_RECORD_RESPONSE" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+                echo "$CHANGE_RECORD_RESPONSE" | grep '"releaseNotesStatus":"generated"'
+                echo "$CHANGE_RECORD_RESPONSE" | grep '"changeRecordReady":true'
+
+                echo "$APPROVAL_RESPONSE" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+                echo "$APPROVAL_RESPONSE" | grep "\\"approvalStatus\\":\\"$EXPECTED_APPROVAL_STATUS\\""
+                echo "$APPROVAL_RESPONSE" | grep "\\"approvedBy\\":\\"$EXPECTED_APPROVED_BY\\""
+
+                echo "$PROMOTION_RESPONSE" | grep '"deployTarget":"staging"'
+                echo "$PROMOTION_RESPONSE" | grep '"promotionTarget":"prodlike"'
+                echo "$PROMOTION_RESPONSE" | grep '"releaseManifestMatchesRuntime":true'
+
+                if [ "$PROMOTE_TO_PRODLIKE" = "true" ]; then
+                  echo "$APPROVAL_RESPONSE" | grep '"approvalRecordReady":true'
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":true'
+                  echo "$PROMOTION_RESPONSE" | grep '"approvalReady":true'
+                else
+                  echo "$PROMOTION_RESPONSE" | grep '"promotionReady":false'
+                fi
+                '''
+            }
+        }
+
+        stage('Promote Day 47 To Prodlike') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'true'
+                }
+            }
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "Promoting Day 47 release to prodlike simulation..."
+
+                    docker compose --env-file "$STAGING_ENV_FILE" down || true
+                    docker compose --env-file "$PRODLIKE_ENV_FILE" up -d
+
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}' 2>/dev/null || echo "unknown")
+
+                    if [ "$BACKEND_HEALTH" != "healthy" ]; then
+                      docker logs --tail=80 "$BACKEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    if [ "$FRONTEND_RUNNING" != "true" ]; then
+                      docker logs --tail=80 "$FRONTEND_CONTAINER" || true
+                      exit 1
+                    fi
+
+                    echo "DAY47_PROMOTION_PERFORMED=true" > ../day47-promotion-result.env
+                    '''
+                }
+            }
+        }
+
+        stage('Record Day 47 No Promotion') {
+            when {
+                expression {
+                    return params.PROMOTE_TO_PRODLIKE == 'false'
+                }
+            }
+            steps {
+                sh '''
+                set -e
+                echo "DAY47_PROMOTION_PERFORMED=false" > day47-promotion-result.env
+                cat day47-promotion-result.env
+                '''
+            }
+        }
+
+        stage('Verify Day 47 Final Deployment State') {
+            steps {
+                sh '''
+                set -e
+
+                PROMOTION_PERFORMED=$(grep DAY47_PROMOTION_PERFORMED day47-promotion-result.env | cut -d '=' -f 2)
+
+                FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-final-config' http://127.0.0.1:3000/api/config")
+                FINAL_CHANGE_RECORD=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-final-change-record' http://127.0.0.1:3000/api/change-record")
+                FINAL_APPROVAL=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-final-approval-record' http://127.0.0.1:3000/api/approval-record")
+                FINAL_STABILITY=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-final-stability' http://127.0.0.1:3000/api/stability")
+                FINAL_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+
+                echo "$FINAL_CONFIG"
+                echo "$FINAL_CHANGE_RECORD"
+                echo "$FINAL_APPROVAL"
+                echo "$FINAL_STABILITY"
+                echo "$FINAL_IMAGE"
+
+                if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                  echo "$FINAL_CONFIG" | grep '"environment":"day47-prodlike-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"prodlike"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_PRODLIKE_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day47-backend:$EXPECTED_PRODLIKE_IMAGE_TAG"
+                else
+                  echo "$FINAL_CONFIG" | grep '"environment":"day47-staging-env"'
+                  echo "$FINAL_CONFIG" | grep '"deployTarget":"staging"'
+                  echo "$FINAL_CONFIG" | grep "\\"imageTag\\":\\"$EXPECTED_STAGING_IMAGE_TAG\\""
+                  echo "$FINAL_IMAGE" | grep "day47-backend:$EXPECTED_STAGING_IMAGE_TAG"
+                fi
+
+                echo "$FINAL_CHANGE_RECORD" | grep "\\"changeRecordId\\":\\"$EXPECTED_CHANGE_RECORD_ID\\""
+                echo "$FINAL_CHANGE_RECORD" | grep '"releaseNotesStatus":"generated"'
+                echo "$FINAL_APPROVAL" | grep "\\"approvalStatus\\":\\"$EXPECTED_APPROVAL_STATUS\\""
+                echo "$FINAL_APPROVAL" | grep "\\"approvedBy\\":\\"$EXPECTED_APPROVED_BY\\""
+                echo "$FINAL_STABILITY" | grep '"stable":true'
+                echo "$FINAL_STABILITY" | grep '"releaseManifestMatchesRuntime":true'
+                '''
+            }
+        }
+
+        stage('Smoke Test Day 47 API Metrics Frontend') {
+            steps {
+                sh '''
+                set -e
+
+                API_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-api-smoke' http://127.0.0.1:3000/api/message")
+                METRICS_RESPONSE=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-metrics-smoke' http://127.0.0.1:3000/metrics")
+                PAGE_RESPONSE=$(docker exec "$FRONTEND_CONTAINER" sh -c "wget -qO- http://127.0.0.1/")
+
+                echo "$API_RESPONSE"
+                echo "$METRICS_RESPONSE"
+                echo "$PAGE_RESPONSE"
+
+                echo "$API_RESPONSE" | grep 'Hello from Day 47 backend API'
+                echo "$METRICS_RESPONSE" | grep '"metricsEnabled":true'
+                echo "$METRICS_RESPONSE" | grep '"/api/approval-record"'
+                echo "$PAGE_RESPONSE" | grep 'DevOps Day 47'
+                echo "$PAGE_RESPONSE" | grep 'release approval gate'
+                '''
+            }
+        }
+
+        stage('Verify Day 47 Backend Logs') {
+            steps {
+                sh '''
+                set -e
+
+                LOGS=$(docker logs "$BACKEND_CONTAINER" 2>&1)
+
+                echo "$LOGS" | grep 'request_completed'
+                echo "$LOGS" | grep 'day47-api-smoke'
+                echo "$LOGS" | grep 'day47-final-config'
+                echo "$LOGS" | grep 'day47-final-approval-record'
+                echo "$LOGS" | grep "$EXPECTED_CHANGE_RECORD_ID"
+                echo "$LOGS" | grep "$EXPECTED_APPROVAL_STATUS"
+                '''
+            }
+        }
+
+        stage('Write Day 47 Deployment Audit Report') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    mkdir -p "$AUDIT_DIR"
+
+                    AUDIT_CREATED_AT=$(date -u +%Y-%m-%dT%H-%M-%SZ)
+                    BACKEND_IMAGE=$(docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}')
+                    FRONTEND_IMAGE=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.Config.Image}}')
+                    BACKEND_HEALTH=$(docker inspect "$BACKEND_CONTAINER" --format='{{.State.Health.Status}}')
+                    FRONTEND_RUNNING=$(docker inspect "$FRONTEND_CONTAINER" --format='{{.State.Running}}')
+                    PROMOTION_PERFORMED=$(grep DAY47_PROMOTION_PERFORMED ../day47-promotion-result.env | cut -d '=' -f 2)
+
+                    FINAL_CONFIG=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-audit-config' http://127.0.0.1:3000/api/config")
+                    FINAL_CHANGE_RECORD=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-audit-change-record' http://127.0.0.1:3000/api/change-record")
+                    FINAL_APPROVAL=$(docker exec "$BACKEND_CONTAINER" sh -c "wget -qO- --header='X-Request-Id: day47-audit-approval-record' http://127.0.0.1:3000/api/approval-record")
+
+                    if [ "$PROMOTION_PERFORMED" = "true" ]; then
+                      FINAL_IMAGE_TAG="$EXPECTED_PRODLIKE_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="prodlike"
+                    else
+                      FINAL_IMAGE_TAG="$EXPECTED_STAGING_IMAGE_TAG"
+                      FINAL_DEPLOY_TARGET="staging"
+                    fi
+
+                    cat > "$AUDIT_JSON" <<EOF
+{
+  "day": "Day 47",
+  "auditCreatedAt": "$AUDIT_CREATED_AT",
+  "jenkinsBuildNumber": "$EXPECTED_BUILD_NUMBER",
+  "promoteToProdlike": "$PROMOTE_TO_PRODLIKE",
+  "forceStagingStabilityFailure": "$FORCE_STAGING_STABILITY_FAILURE",
+  "skipReleaseNotes": "$SKIP_RELEASE_NOTES",
+  "promotionPerformed": $PROMOTION_PERFORMED,
+  "changeRecordId": "$EXPECTED_CHANGE_RECORD_ID",
+  "releaseNotesStatus": "$EXPECTED_RELEASE_NOTES_STATUS",
+  "approvalStatus": "$EXPECTED_APPROVAL_STATUS",
+  "approvedBy": "$EXPECTED_APPROVED_BY",
+  "approvalReason": "$EXPECTED_APPROVAL_REASON",
+  "releaseNotesFile": "$RELEASE_NOTES_MD",
+  "changeRecordFile": "$CHANGE_RECORD_JSON",
+  "approvalRecordFile": "$APPROVAL_RECORD_JSON",
+  "expected": {
+    "stagingImageTag": "$EXPECTED_STAGING_IMAGE_TAG",
+    "prodlikeImageTag": "$EXPECTED_PRODLIKE_IMAGE_TAG",
+    "rollbackImageTag": "$EXPECTED_ROLLBACK_IMAGE_TAG",
+    "finalImageTag": "$FINAL_IMAGE_TAG",
+    "finalDeployTarget": "$FINAL_DEPLOY_TARGET",
+    "gitCommit": "$EXPECTED_GIT_COMMIT",
+    "releaseCreatedAt": "$EXPECTED_RELEASE_CREATED_AT"
+  },
+  "containers": {
+    "backendContainer": "$BACKEND_CONTAINER",
+    "frontendContainer": "$FRONTEND_CONTAINER",
+    "backendImage": "$BACKEND_IMAGE",
+    "frontendImage": "$FRONTEND_IMAGE",
+    "backendHealth": "$BACKEND_HEALTH",
+    "frontendRunning": "$FRONTEND_RUNNING"
+  },
+  "verification": {
+    "releaseNotesGenerated": true,
+    "changeRecordGenerated": true,
+    "approvalRecordGenerated": true,
+    "approvalGateEvaluated": true,
+    "stagingBuilt": true,
+    "prodlikeBuilt": true,
+    "stagingMonitoringPassed": true,
+    "promotionGateEvaluated": true,
+    "promotionPerformed": $PROMOTION_PERFORMED,
+    "finalDeploymentHealthy": true,
+    "releaseManifestMatchesRuntime": true,
+    "metricsPassed": true,
+    "logsPassed": true
+  }
+}
+EOF
+
+                    cat > "$AUDIT_TEXT" <<EOF
+Day 47 Deployment Audit Report
+==============================
+
+Audit created at: $AUDIT_CREATED_AT
+Jenkins build number: $EXPECTED_BUILD_NUMBER
+
+Promote to prodlike: $PROMOTE_TO_PRODLIKE
+Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE
+Skip release notes: $SKIP_RELEASE_NOTES
+Promotion performed: $PROMOTION_PERFORMED
+
+Change record ID: $EXPECTED_CHANGE_RECORD_ID
+Release notes status: $EXPECTED_RELEASE_NOTES_STATUS
+Approval status: $EXPECTED_APPROVAL_STATUS
+Approved by: $EXPECTED_APPROVED_BY
+Approval reason: $EXPECTED_APPROVAL_REASON
+
+Release notes file: $RELEASE_NOTES_MD
+Change record file: $CHANGE_RECORD_JSON
+Approval record file: $APPROVAL_RECORD_JSON
+
+Staging image tag: $EXPECTED_STAGING_IMAGE_TAG
+Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG
+Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG
+Final image tag: $FINAL_IMAGE_TAG
+Final deploy target: $FINAL_DEPLOY_TARGET
+
+Backend image: $BACKEND_IMAGE
+Frontend image: $FRONTEND_IMAGE
+Backend health: $BACKEND_HEALTH
+Frontend running: $FRONTEND_RUNNING
+
+Final config response:
+$FINAL_CONFIG
+
+Final change record response:
+$FINAL_CHANGE_RECORD
+
+Final approval response:
+$FINAL_APPROVAL
+EOF
+
+                    cp ../day47-staging-stability-checks.log "$AUDIT_DIR/day47-staging-stability-checks.log" 2>/dev/null || true
+
+                    grep "\\"day\\": \\"Day 47\\"" "$AUDIT_JSON"
+                    grep "\\"approvalRecordGenerated\\": true" "$AUDIT_JSON"
+                    grep "\\"approvalGateEvaluated\\": true" "$AUDIT_JSON"
+                    grep "\\"approvedBy\\": \\"$EXPECTED_APPROVED_BY\\"" "$AUDIT_JSON"
+                    grep "\\"backendHealth\\": \\"healthy\\"" "$AUDIT_JSON"
+                    grep "\\"releaseManifestMatchesRuntime\\": true" "$AUDIT_JSON"
+
+                    grep "Day 47 Deployment Audit Report" "$AUDIT_TEXT"
+                    grep "$EXPECTED_CHANGE_RECORD_ID" "$AUDIT_TEXT"
+                    grep "$EXPECTED_APPROVED_BY" "$AUDIT_TEXT"
+                    '''
+                }
+            }
+        }
+
+        stage('Package Day 47 Evidence Bundle') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json > "$AUDIT_DIR/day47-running-release.json"
+                    docker inspect "$BACKEND_CONTAINER" > "$AUDIT_DIR/day47-backend-container-inspect.json"
+                    docker inspect "$FRONTEND_CONTAINER" > "$AUDIT_DIR/day47-frontend-container-inspect.json"
+
+                    {
+                      echo "Day 47 Evidence Bundle Contents"
+                      echo "==============================="
+                      echo "Promote to prodlike: $PROMOTE_TO_PRODLIKE"
+                      echo "Force staging stability failure: $FORCE_STAGING_STABILITY_FAILURE"
+                      echo "Skip release notes: $SKIP_RELEASE_NOTES"
+                      echo "Change record ID: $EXPECTED_CHANGE_RECORD_ID"
+                      echo "Approval status: $EXPECTED_APPROVAL_STATUS"
+                      echo "Approved by: $EXPECTED_APPROVED_BY"
+                      echo "Approval reason: $EXPECTED_APPROVAL_REASON"
+                      echo "Staging image tag: $EXPECTED_STAGING_IMAGE_TAG"
+                      echo "Prodlike image tag: $EXPECTED_PRODLIKE_IMAGE_TAG"
+                      echo "Rollback image tag: $EXPECTED_ROLLBACK_IMAGE_TAG"
+                      echo ""
+                      echo "Included files:"
+                      find "$AUDIT_DIR" "$RELEASE_NOTES_DIR" -maxdepth 1 -type f | sort
+                    } > "$AUDIT_DIR/day47-evidence-summary.txt"
+
+                    sha256sum \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$AUDIT_DIR/day47-running-release.json" \
+                      "$AUDIT_DIR/day47-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day47-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day47-evidence-summary.txt" \
+                      "$RELEASE_NOTES_MD" \
+                      "$CHANGE_RECORD_JSON" \
+                      "$APPROVAL_RECORD_JSON" \
+                      > "$CHECKSUM_FILE"
+
+                    tar -czf "$EVIDENCE_BUNDLE" \
+                      "$AUDIT_JSON" \
+                      "$AUDIT_TEXT" \
+                      "$CHECKSUM_FILE" \
+                      "$AUDIT_DIR/day47-running-release.json" \
+                      "$AUDIT_DIR/day47-backend-container-inspect.json" \
+                      "$AUDIT_DIR/day47-frontend-container-inspect.json" \
+                      "$AUDIT_DIR/day47-evidence-summary.txt" \
+                      "$RELEASE_NOTES_MD" \
+                      "$CHANGE_RECORD_JSON" \
+                      "$APPROVAL_RECORD_JSON"
+
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day47-deployment-audit.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day47-deployment-audit.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day47-evidence-checksums.txt"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day47-release-notes.md"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day47-change-record.json"
+                    tar -tzf "$EVIDENCE_BUNDLE" | grep "day47-approval-record.json"
+
+                    sha256sum -c "$CHECKSUM_FILE"
+                    '''
+                }
+            }
+        }
+
+        stage('Archive Day 47 Evidence Artifacts') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    archiveArtifacts artifacts: 'deployment-audit/day47-*,release-notes/day47-*', fingerprint: true
+                }
+            }
+        }
+
+        stage('Show Day 47 Deployment Diagnostics') {
+            steps {
+                dir("${PROJECT_DIR}") {
+                    sh '''
+                    set -e
+
+                    echo "PROMOTE_TO_PRODLIKE=$PROMOTE_TO_PRODLIKE"
+                    echo "FORCE_STAGING_STABILITY_FAILURE=$FORCE_STAGING_STABILITY_FAILURE"
+                    echo "SKIP_RELEASE_NOTES=$SKIP_RELEASE_NOTES"
+                    echo "APPROVAL_STATUS=$APPROVAL_STATUS"
+                    echo "APPROVED_BY=$APPROVED_BY"
+                    echo "EXPECTED_CHANGE_RECORD_ID=$EXPECTED_CHANGE_RECORD_ID"
+
+                    ls -la "$AUDIT_DIR"
+                    ls -la "$RELEASE_NOTES_DIR"
+
+                    docker ps -a --filter "name=day47_"
+                    docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+                    docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+                    docker logs --tail=120 "$BACKEND_CONTAINER" || true
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Day 47 pipeline completed successfully. Release approval gate verified.'
+        }
+
+        failure {
+            echo 'Day 47 pipeline failed. Collecting failure diagnostics...'
+        }
+
+        always {
+            dir("${PROJECT_DIR}") {
+                sh '''
+                echo "Final Day 47 audit files:"
+                ls -la "$AUDIT_DIR" || true
+
+                echo "Final Day 47 release notes files:"
+                ls -la "$RELEASE_NOTES_DIR" || true
+
+                echo "Final Day 47 evidence bundle listing:"
+                tar -tzf "$EVIDENCE_BUNDLE" || true
+
+                echo "Final Day 47 container list:"
+                docker ps -a --filter "name=day47_" || true
+
+                echo "Final Day 47 backend image:"
+                docker inspect "$BACKEND_CONTAINER" --format='{{.Config.Image}}' || true
+
+                echo "Final Day 47 backend release manifest:"
+                docker exec "$BACKEND_CONTAINER" cat /app/release.json || true
+
+                echo "Final Day 47 backend logs:"
+                docker logs --tail=120 "$BACKEND_CONTAINER" || true
+
+                echo "Final Day 47 frontend logs:"
+                docker logs --tail=50 "$FRONTEND_CONTAINER" || true
+                '''
+            }
+        }
+    }
+}
