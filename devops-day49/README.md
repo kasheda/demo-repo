@@ -152,3 +152,10 @@ After promotion, the prodlike deployment must survive a monitoring window.
 Day 49 teaches the DevOps rule:
 
     A release should be monitored after promotion, and recovery should be automatic if prodlike becomes unsafe.
+
+## Post-Promotion Safety Rollback
+
+After promotion to the prodlike environment, Jenkins monitors the
+`/api/prodlike-safety` endpoint. If monitoring fails and
+`PRODLIKE_ROLLBACK_ON_FAILURE=true`, the pipeline automatically restores
+the rollback image and verifies the recovered staging deployment.
