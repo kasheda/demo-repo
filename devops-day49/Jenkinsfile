@@ -367,7 +367,39 @@ README.md
                     set -e
 
                     set +e
-                    node app.js > day49-missing-env.log 2>&1
+                    env \
+  -u PORT \
+  -u APP_ENV \
+  -u APP_VERSION \
+  -u SERVICE_NAME \
+  -u FEATURE_FLAG \
+  -u LOG_LEVEL \
+  -u METRICS_ENABLED \
+  -u DEPLOY_TARGET \
+  -u BUILD_NUMBER \
+  -u GIT_COMMIT \
+  -u IMAGE_TAG \
+  -u RELEASE_CREATED_AT \
+  -u ROLLBACK_IMAGE_TAG \
+  -u ROLLBACK_MODE \
+  -u STABILITY_CHECK_WINDOW_SECONDS \
+  -u STABILITY_CHECK_INTERVAL_SECONDS \
+  -u FORCE_STABILITY_FAILURE \
+  -u FORCE_PRODLIKE_STABILITY_FAILURE \
+  -u PRODLIKE_ROLLBACK_ON_FAILURE \
+  -u PROMOTION_TARGET \
+  -u PROMOTION_APPROVED \
+  -u CHANGE_RECORD_ID \
+  -u RELEASE_NOTES_REQUIRED \
+  -u RELEASE_NOTES_STATUS \
+  -u APPROVAL_REQUIRED \
+  -u APPROVAL_STATUS \
+  -u APPROVED_BY \
+  -u APPROVAL_REASON \
+  -u DEPLOYMENT_WINDOW_STATUS \
+  -u CHANGE_FREEZE_ACTIVE \
+  -u FREEZE_REASON \
+  node app.js > day49-missing-env.log 2>&1
                     EXIT_CODE=$?
                     set -e
 
