@@ -7,6 +7,8 @@ const requiredEnvVariables = [
   'LOG_LEVEL',
   'METRICS_ENABLED',
   'DEPLOY_TARGET',
+  'BUILD_NUMBER',
+  'GIT_COMMIT',
   'IMAGE_TAG',
   'RELEASE_CREATED_AT',
   'ROLLBACK_IMAGE_TAG',
@@ -21,7 +23,13 @@ const requiredEnvVariables = [
   'CHANGE_RECORD_ID',
   'RELEASE_NOTES_REQUIRED',
   'RELEASE_NOTES_STATUS',
-  'APPROVAL_REQUIRED'
+  'APPROVAL_REQUIRED',
+  'APPROVAL_STATUS',
+  'APPROVED_BY',
+  'APPROVAL_REASON',
+  'DEPLOYMENT_WINDOW_STATUS',
+  'CHANGE_FREEZE_ACTIVE',
+  'FREEZE_REASON'
 ];
 
 const missingEnvVars = requiredEnvVariables.filter((name) => !process.env[name]);
@@ -223,6 +231,7 @@ function logInfo(message, details = {}) {
       imageTag: IMAGE_TAG,
       rollbackMode: ROLLBACK_MODE,
       prodlikeRollbackOnFailure: PRODLIKE_ROLLBACK_ON_FAILURE,
+      changeRecordId: CHANGE_RECORD_ID,
       message,
       ...details
     }));
@@ -237,6 +246,7 @@ function logError(message, details = {}) {
     imageTag: IMAGE_TAG,
     rollbackMode: ROLLBACK_MODE,
     prodlikeRollbackOnFailure: PRODLIKE_ROLLBACK_ON_FAILURE,
+    changeRecordId: CHANGE_RECORD_ID,
     message,
     ...details
   }));
@@ -552,6 +562,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`Deploy target: ${DEPLOY_TARGET}`);
   console.log(`Image tag: ${IMAGE_TAG}`);
   console.log(`Rollback image tag: ${ROLLBACK_IMAGE_TAG}`);
+  console.log(`Change record ID: ${CHANGE_RECORD_ID}`);
   console.log(`Prodlike rollback on failure: ${PRODLIKE_ROLLBACK_ON_FAILURE}`);
   console.log(`Force prodlike stability failure: ${FORCE_PRODLIKE_STABILITY_FAILURE}`);
   console.log(`Release manifest matches runtime: ${releaseManifestMatchesRuntime(manifest)}`);
