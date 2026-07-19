@@ -1,4 +1,4 @@
-const requiredEnvVars = [
+const requiredEnvVariables = [
   'PORT',
   'APP_ENV',
   'APP_VERSION',
@@ -7,8 +7,6 @@ const requiredEnvVars = [
   'LOG_LEVEL',
   'METRICS_ENABLED',
   'DEPLOY_TARGET',
-  'BUILD_NUMBER',
-  'GIT_COMMIT',
   'IMAGE_TAG',
   'RELEASE_CREATED_AT',
   'ROLLBACK_IMAGE_TAG',
@@ -23,13 +21,7 @@ const requiredEnvVars = [
   'CHANGE_RECORD_ID',
   'RELEASE_NOTES_REQUIRED',
   'RELEASE_NOTES_STATUS',
-  'APPROVAL_REQUIRED',
-  'APPROVAL_STATUS',
-  'APPROVED_BY',
-  'APPROVAL_REASON',
-  'DEPLOYMENT_WINDOW_STATUS',
-  'CHANGE_FREEZE_ACTIVE',
-  'FREEZE_REASON'
+  'APPROVAL_REQUIRED'
 ];
 
 const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
