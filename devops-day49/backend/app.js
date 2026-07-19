@@ -24,7 +24,7 @@ const requiredEnvVariables = [
   'APPROVAL_REQUIRED'
 ];
 
-const missingEnvVars = requiredEnvVars.filter((name) => !process.env[name]);
+const missingEnvVars = requiredEnvVariables.filter((name) => !process.env[name]);
 
 if (missingEnvVars.length > 0) {
   console.error('Day 49 backend failed to start.');
