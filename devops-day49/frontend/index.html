@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>DevOps Day 49</title>
+</head>
+<body>
+  <h1>DevOps Day 49</h1>
+  <p>Frontend starts after the Day 49 backend becomes healthy.</p>
+  <p>Day 49 adds post-promotion prodlike monitoring and automatic safety rollback.</p>
+
+  <h2>Backend API Message</h2>
+  <pre id="api-message">Loading message...</pre>
+
+  <h2>Backend Runtime Config</h2>
+  <pre id="api-config">Loading config...</pre>
+
+  <h2>Backend Release Manifest</h2>
+  <pre id="api-release">Loading release manifest...</pre>
+
+  <h2>Backend Stability</h2>
+  <pre id="api-stability">Loading stability status...</pre>
+
+  <h2>Backend Change Record</h2>
+  <pre id="api-change-record">Loading change record...</pre>
+
+  <h2>Backend Approval Record</h2>
+  <pre id="api-approval-record">Loading approval record...</pre>
+
+  <h2>Backend Deployment Window</h2>
+  <pre id="api-deployment-window">Loading deployment window...</pre>
+
+  <h2>Backend Prodlike Safety</h2>
+  <pre id="api-prodlike-safety">Loading prodlike safety...</pre>
+
+  <h2>Backend Promotion Readiness</h2>
+  <pre id="api-promotion-ready">Loading promotion readiness...</pre>
+
+  <h2>Backend Metrics</h2>
+  <pre id="metrics">Loading metrics...</pre>
+
+  <script>
+    const calls = [
+      ['api-message', '/api/message', 'day49-frontend-message-request'],
+      ['api-config', '/api/config', 'day49-frontend-config-request'],
+      ['api-release', '/api/release', 'day49-frontend-release-request'],
+      ['api-stability', '/api/stability', 'day49-frontend-stability-request'],
+      ['api-change-record', '/api/change-record', 'day49-frontend-change-record-request'],
+      ['api-approval-record', '/api/approval-record', 'day49-frontend-approval-record-request'],
+      ['api-deployment-window', '/api/deployment-window', 'day49-frontend-deployment-window-request'],
+      ['api-prodlike-safety', '/api/prodlike-safety', 'day49-frontend-prodlike-safety-request'],
+      ['api-promotion-ready', '/api/promotion-ready', 'day49-frontend-promotion-ready-request'],
+      ['metrics', '/metrics', 'day49-frontend-metrics-request']
+    ];
+
+    calls.forEach(([elementId, url, requestId]) => {
+      fetch(url, {
+        headers: {
+          'X-Request-Id': requestId
+        }
+      })
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById(elementId).textContent =
+            JSON.stringify(data, null, 2);
+        })
+        .catch(error => {
+          document.getElementById(elementId).textContent =
+            `Failed to reach Day 49 endpoint ${url}: ${error}`;
+        });
+    });
+  </script>
+</body>
+</html>
